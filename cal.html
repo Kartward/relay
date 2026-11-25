@@ -52,6 +52,10 @@ document.getElementById('b').addEventListener('click', async () => {
     w(36, 'data'); v.setUint32(40, n * 2, true);
     const el = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })));
     el.loop = true; el.play().catch(() => {});
+    if (navigator.mediaSession && typeof MediaMetadata !== 'undefined') {
+      navigator.mediaSession.metadata = new MediaMetadata({ title: 'cal', artist: 'cal' });
+      navigator.mediaSession.playbackState = 'playing';
+    }
   } catch (_) {}
   try { await speechSynthesis.speak(new SpeechSynthesisUtterance('go')); } catch (_) {}
   if (navigator.mediaSession) {
