@@ -495,8 +495,8 @@
         if (s === 'RELAY') { enterAndRecord(); return; }
         if (s === 'RECORDING') return;                             // ignored: silence or the 60 s cap ends it
         if (s === 'CONFIRM') { dropPending(); startTake().catch(() => {}); return; }   // discard, record again
-        if (s === 'IDLE' || s === 'SPEAKING') { startTake().catch(() => {}); return; } // next question / interrupt reply
-        busyTick(s === 'TRANSCRIBING' ? 'Transcribing, wait' : 'Busy');                // TRANSCRIBING, THINKING
+        if (s === 'IDLE' || s === 'SPEAKING' || s === 'THINKING') { startTake().catch(() => {}); return; } // new question, interrupt reply or a slow answer
+        busyTick('Transcribing, wait');                                                // TRANSCRIBING
         return;
 
       case 'nexttrack':                                            // volume-up double
