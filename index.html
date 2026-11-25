@@ -148,7 +148,7 @@ const DEFAULTS = {
   model: 'gpt-6.1-terra',
   ttsModel: 'gpt-4o-mini-tts',
   voice: 'alloy',
-  ttsSpeed: 0.4,
+  ttsSpeed: 0.8,
   system: DEFAULT_SYSTEM
 };
 const VOICES = ['alloy','ash','ballad','coral','echo','fable','nova','onyx','sage','shimmer','verse'];
@@ -157,7 +157,7 @@ const KEEPALIVE_TIMEOUT_MS = 90000;
 const CHAT_TIMEOUT_MS = 30000;
 const TTS_TIMEOUT_MS = 45000;
 const TTS_CHUNK = 3000;
-const GAP_MS = 500; // real silence inserted before every segment
+const GAP_MS = 450; // real silence inserted before every segment
 const WORD_GAP = 1; // insert an unspoken punctuation pause every N words (1 = every word)
 
 function spaceOut(text) {
@@ -582,7 +582,15 @@ async function produce(raw) {
   }).catch(() => {});
   const items = [];
   const parts = chunkForTts(spaceOut(reply));
-  const clips = await Promise.all(parts.map((p) => speech(p).catch(() => null)));
+  const clips = new Array(parts.length).fill(null);
+  let next = 0;
+  const worker = async () => {
+    while (next < parts.length) {
+      const i = next++;
+      try { clips[i] = await speech(parts[i]); } catch (e) { clips[i] = null; }
+    }
+  };
+  await Promise.all(Array.from({ length: 6 }, worker));
   parts.forEach((p, i) => {
     if (clips[i]) items.push({ kind: 'clip', buffer: clips[i], text: p, set: items });
   });
