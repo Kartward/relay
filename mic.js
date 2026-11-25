@@ -1,24 +1,19 @@
-/* mic.js — voice input mode + weighted press counter (pen button), volume-key aliases.
+/* mic.js — voice input mode, driven by four distinct media keys (no counting, no gesture window).
  *
  * Loaded by index.html BEFORE its inline script: it wraps
  * navigator.mediaSession.setActionHandler so setupMediaSession()'s relay handlers
  * are kept, and so ?cal=1 binds its calibration handlers directly.
  *
- * Commands
- *   Pen (counted: previoustrack +1, nexttrack +2, merge / dedupe / window as before; >4 acts as 4)
- *     RELAY        1: enter voice mode and record        (a gesture starting with nexttrack = today's skip)
- *     IDLE         1: record   2: "nothing to send"   3: repeat last reply   4: leave
- *     SPEAKING     1: stop speech, record   2: "nothing to send"   3: repeat   4: leave
- *     RECORDING    1: stop early -> transcribe          4: discard, leave
- *     TRANSCRIBING busy tick                            4: discard, leave
- *     CONFIRM      1: discard, record again   2: SEND   3: read transcript again   4: leave
- *     THINKING     busy tick                3: repeat last reply   4: leave
- *   Volume keys (never counted)
- *     volume-up SHORT -> seekforward : COUNTED, +1 per press — the only command key in use
- *                                      (Button Mapper: short press = media fast-forward;
- *                                      the S Pen sends nothing a page can observe)
- *     volume-down     -> no mapping, a normal volume key. A media 'stop' from elsewhere
- *                        (e.g. a headset) still leaves voice mode.
+ * Bindings (Button Mapper) — every action fires on the event
+ *   seekforward   volume-up single    RELAY: enter voice mode + record
+ *                                     CONFIRM: discard transcript, record again
+ *                                     IDLE / SPEAKING: record (interrupts a reply)
+ *                                     RECORDING: ignored   TRANSCRIBING / THINKING: busy tick
+ *   nexttrack     volume-up double    CONFIRM: send to handle()        elsewhere in voice mode: busy tick
+ *   previoustrack volume-down single  CONFIRM: read the transcript again   elsewhere in voice mode: busy tick
+ *   stop          volume-down double  voice mode, any state: leave
+ *   In RELAY, nexttrack / previoustrack / stop keep today's handlers (skip / replay / stop).
+ * A recording ends only on silence (silenceEndMs) or at the 60 s cap.
  *
  * Globals from index.html, looked up at call time only:
  *   handle, Player (q, busy, paused, current, last, enqueue, flush), AudioEngine (ctx, out),
@@ -31,24 +26,15 @@
 
   /* ------------------------------------------------------------------ tuning */
   const CFG = {
-    T_merge: 450,       // ms: previoustrack this close before a nexttrack => nexttrack adds 1
-    unclearBand: 75,    // ms: gap in [T_merge, T_merge+band) is unclear => also merged (resolves to 2)
-    nextNextMin: 300,   // ms: nexttrack->nexttrack faster than this is unclear => adds 0
-    G: 700,             // ms: gesture window
-    cap: 1500,          // ms: hard cap from the first event
-    sliding: true,      // true: closes G after the LAST event, never later than cap after the first.
-                        // false: closes exactly G after the first event.
-    dedupe: 80,         // ms: same keycode repeated within this is ignored
-    maxCount: 4,        // counts above this act as this; 4 = leave voice mode, in every state
-    aliasGap: 600,      // ms: volume-key alias repeats (Button Mapper auto-repeat) within this are ignored
+    dedupe: 80,         // ms: the same action delivered twice (MediaSession + keydown) within this is one event
 
     confirmMs: 20000,   // CONFIRM: unsent transcript is discarded this long after the read-back ends
-    confirmHint: 'Press twice to send.',
+    confirmHint: 'Double-press volume up to send.',
     pulseMs: 1000,      // busy pulse interval while transcribing
     enterLeadMs: 340,   // relay -> voice: let the "voice on" tone finish before the start tone
 
     noSpeechMs: 5000,   // no speech onset within this => cancel, nothing uploaded
-    silenceEndMs: 1500, // trailing silence after speech => stop and transcribe
+    silenceEndMs: 800,  // trailing silence after speech => stop and transcribe
     maxMs: 60000,       // hard cap; still transcribes
     warnMs: 50000,      // vibration warning
     minSpeechMs: 300,   // less detected speech than this => not uploaded
@@ -176,7 +162,7 @@
         this.mode = 'MIC'; safe(() => localStorage.setItem(LS_MODE, 'MIC'));
         announce('MIC', quiet);
       } else {
-        Voice.teardown();                       // gesture, recording, transcription, CONFIRM
+        Voice.teardown();                       // recording, transcription, CONFIRM
         this.invalidate();                      // pending mic replies are dropped
         flushPlayback();
         this.mode = 'RELAY'; safe(() => localStorage.setItem(LS_MODE, 'RELAY'));
@@ -188,7 +174,7 @@
   function announce(m, quiet) {
     if (m === 'MIC') {
       tone('voiceon'); buzz(40); show('Voice mode');
-      if (!quiet) say('Voice mode. Press once to talk.');
+      if (!quiet) say('Voice mode. Press volume up to talk.');
     } else {
       tone('voiceoff'); buzz([40, 60, 40]); show('Voice off, relay on');
       if (!quiet) say('Voice off.');
@@ -329,17 +315,13 @@
     inflight.delete(t);
   }
 
-  // reason: 'press' | 'silence' | 'cap' | 'nospeech'. Every path ends audibly in TRANSCRIBING,
-  // CONFIRM, or voice idle with a spoken reason.
+  // reason: 'silence' | 'cap' | 'nospeech' — there is no manual stop. Every path ends audibly in
+  // TRANSCRIBING, CONFIRM, or voice idle with a spoken reason.
   async function finishTake(t, reason) {
-    if (!t || t.cancelled) return;
-    if (t.phase === 'opening') {                // pressed before the mic was even live
-      cleanupTake(t); soft("Didn't catch that."); return;
-    }
-    if (t.phase !== 'recording') return;
+    if (!t || t.cancelled || t.phase !== 'recording') return;
     t.phase = 'stopping';
     if (take === t) take = null;
-    inflight.add(t);                            // TRANSCRIBING from this moment: presses get the busy tick
+    inflight.add(t);                            // TRANSCRIBING from this moment: keys get the busy tick
     clearTimers(t); stopVad(t);
     safe(() => { if (t.rec.state !== 'inactive') t.rec.stop(); });
     await Promise.race([t.stopped, sleep(2000)]);
@@ -467,7 +449,6 @@
   }
   function expire(p) {
     if (pending !== p) return;
-    if (G.open) { p.timer = setTimeout(() => expire(p), 1000); return; }   // a gesture is deciding
     dropPending();
     tone('expired'); buzz([30, 50, 30]); show('Not sent, discarded');
   }
@@ -479,19 +460,6 @@
     safe(() => handle(p.text, 'mic-' + p.id, 'mic'));   // the ONLY call into handle(); produce() owns retries and spoken errors
   }
 
-  function repeatLast() {
-    const ms = tone('repeat'); buzz([20, 60, 20]);
-    show('Repeat');
-    setTimeout(() => {
-      if (ModeController.mode !== 'MIC' || take) return;   // left, or a new take started meanwhile
-      const last = safe(() => Player.last);
-      if (!last) { soft('Nothing to repeat yet.'); return; }
-      try {
-        if (Player.current) flushPlayback();              // restart from the beginning
-        Player.enqueue([last], true);                      // same path as Player.playPressed()
-      } catch (e) { fail('Repeat failed.'); }
-    }, ms + 40);
-  }
   function repeatTranscript() {
     const ms = tone('repeat'); buzz([20, 60, 20]);
     show('Heard: ' + (pending ? pending.text : ''));
@@ -500,7 +468,6 @@
 
   const Voice = {
     teardown() {
-      clearTimeout(G.timer); G.open = false; G.take = null; G.spec = null; G.pending = null;
       if (take) cancelTake(take);
       Array.from(inflight).forEach(cancelTake);
       inflight.clear();
@@ -510,154 +477,49 @@
     }
   };
 
-  /* ======================================================== gesture counter */
-  const G = {
-    open: false, firstT: 0, lastT: 0, closeAt: 0, timer: 0,
-    count: 0, startState: 'IDLE',
-    take: null,          // take that was recording when the gesture began
-    spec: null,          // recording this gesture started on count 1
-    pending: null,       // CONFIRM transcript when the gesture began
-    entered: false,      // RELAY gesture: count 1 entered voice mode
-    relayDone: false,    // RELAY gesture starting with nexttrack: today's skip already ran
-    lastPrevT: -1e9, lastNextT: -1e9,
-    swallowUntil: 0      // events before this time are ignored (after leaving voice mode)
-  };
+  /* =========================================================== key bindings */
   const lastKeyT = {};
+  function busyTick(text) { tone('busy'); buzz(15); if (text) show(text); }
 
-  function scheduleClose() {
-    clearTimeout(G.timer);
-    G.closeAt = CFG.sliding ? Math.min(G.lastT + CFG.G, G.firstT + CFG.cap) : G.firstT + CFG.G;
-    G.timer = setTimeout(closeGesture, Math.max(0, G.closeAt - now()));
-  }
-
-  function openGesture(tn) {
-    G.open = true; G.firstT = tn; G.lastT = tn; G.count = 0;
-    G.startState = state();                       // decide from the state at gesture start
-    G.take = (G.startState === 'RECORDING') ? take : null;
-    G.pending = (G.startState === 'CONFIRM') ? pending : null;
-    G.spec = null; G.entered = false; G.relayDone = false;
-    G.lastPrevT = -1e9; G.lastNextT = -1e9;
-  }
-
-  // Deferred outcomes: the ones a further press could still change.
-  function closeGesture() {
-    if (!G.open) return;
-    clearTimeout(G.timer);
-    G.open = false;
-    const s = G.startState, n = G.count, p = G.pending, entered = G.entered;
-    G.take = null; G.spec = null; G.pending = null;
-    if (s === 'CONFIRM' && p && pending === p) {
-      if (n === 1) dropPending();               // replaced by the recording already running
-      else if (n === 2) accept(p);              // the only way into handle()
-      return;
-    }
-    if (s === 'RELAY' && entered && (n === 2 || n === 3) && ModeController.mode === 'MIC') {
-      announce('MIC');                          // stayed in voice mode, idle
-      return;
-    }
-    if ((s === 'IDLE' || s === 'SPEAKING') && n === 2) soft('Nothing to send.');
-  }
-
-  // Pen events only. Volume keys go through alias().
+  // One distinct key per command; every action fires on the event, decided by the current state.
   function onKey(action) {
     const tn = now();
-    if (tn - (lastKeyT[action] || -1e9) < CFG.dedupe) return;     // same keycode within 80 ms
+    if (tn - (lastKeyT[action] || -1e9) < CFG.dedupe) return;     // one press delivered twice
     lastKeyT[action] = tn;
+    const s = state();
 
-    if (G.open && tn >= G.closeAt) closeGesture();                // late timer: this event starts a new gesture
-    if (!G.open) openGesture(tn);
-
-    let w;
-    if (action === 'nexttrack') {
-      if (tn - G.lastNextT < CFG.nextNextMin) w = 0;                           // unclear: hold at current count
-      else if (tn - G.lastPrevT < CFG.T_merge + CFG.unclearBand) w = 1;         // merged double (unclear band => 2)
-      else w = 2;
-      G.lastNextT = tn;
-    } else {
-      w = 1;                                      // previoustrack and seekforward
-      if (action === 'previoustrack') G.lastPrevT = tn;   // merge rule is for the pen's prev->next pair only
-    }
-
-    G.lastT = tn;
-    const before = G.count;
-    G.count = Math.min(CFG.maxCount, G.count + w);
-    scheduleClose();
-    if (G.count > before) act(G.count);           // a count skipped by one weighted event (0 -> 2) never acts
-  }
-
-  // Immediate outcomes for the count just reached; each also undoes what count 1 started.
-  function act(n) {
-    const s = G.startState;
-    if (n === 4) { if (G.spec) cancelTake(G.spec); G.spec = null; leaveVoice(); return; }
-
-    switch (s) {
-      case 'RELAY':
-        if (n === 1) { G.entered = enterAndRecord(); G.spec = G.entered ? take : null; return; }
-        if (G.entered) { if (G.spec) cancelTake(G.spec); G.spec = null; return; }   // idle announce on close
-        if (n === 2 && !G.relayDone) {                                              // gesture began with nexttrack:
-          G.relayDone = true;                                                       // today's relay skip
-          const f = relayH.nexttrack; if (f) safe(() => f());
-          return;
-        }
-        tone('busy'); buzz(15);                                                     // 3 in relay: acknowledged, no action
+    switch (action) {
+      case 'seekforward':                                          // volume-up single
+        if (s === 'RELAY') { enterAndRecord(); return; }
+        if (s === 'RECORDING') return;                             // ignored: silence or the 60 s cap ends it
+        if (s === 'CONFIRM') { dropPending(); startTake().catch(() => {}); return; }   // discard, record again
+        if (s === 'IDLE' || s === 'SPEAKING') { startTake().catch(() => {}); return; } // next question / interrupt reply
+        busyTick(s === 'TRANSCRIBING' ? 'Transcribing, wait' : 'Busy');                // TRANSCRIBING, THINKING
         return;
 
-      case 'IDLE':
-      case 'SPEAKING':
-        if (n === 1) { startTake().catch(() => {}); G.spec = take; return; }
-        if (G.spec) { cancelTake(G.spec); G.spec = null; }
-        if (n === 3) repeatLast();                  // 2: "nothing to send" on close
+      case 'nexttrack':                                            // volume-up double
+        if (s === 'CONFIRM') { accept(pending); return; }          // the only way into handle()
+        busyTick();
         return;
 
-      case 'THINKING':
-        if (n === 3) { repeatLast(); return; }
-        tone('busy'); buzz(15); show('Busy');
+      case 'previoustrack':                                        // volume-down single
+        if (s === 'CONFIRM') { repeatTranscript(); return; }
+        busyTick();
         return;
 
-      case 'RECORDING':
-        if (n === 1 && G.take) finishTake(G.take, 'press').catch(() => {});   // stop early -> transcribe
-        else { tone('busy'); buzz(15); }            // already stopping: acknowledge, nothing else
-        return;
-
-      case 'TRANSCRIBING':
-        tone('busy'); buzz(15); show('Transcribing, wait');
-        return;
-
-      case 'CONFIRM':
-        if (n === 1) { if (G.pending) stopReadBack(G.pending); startTake().catch(() => {}); G.spec = take; return; }
-        if (G.spec) { cancelTake(G.spec); G.spec = null; }
-        if (n === 2) { tone('busy'); buzz(15); show('Sending…'); return; }   // sent on close unless a 3rd press
-        if (n === 3) repeatTranscript();
+      case 'stop':                                                 // volume-down double
+        leaveVoice();
         return;
     }
   }
 
   function enterAndRecord() {
     ModeController.set('MIC', true);
-    if (ModeController.mode !== 'MIC') return false;
+    if (ModeController.mode !== 'MIC') return;
     startTake(CFG.enterLeadMs).catch(() => {});
-    return true;
   }
-  function leaveVoice() {
-    G.swallowUntil = now() + CFG.G;               // trailing presses must not leak into relay handlers
-    ModeController.set('RELAY');
-  }
+  function leaveVoice() { if (ModeController.mode === 'MIC') ModeController.set('RELAY'); }
   function enterVoice() { ModeController.set('MIC'); }
-
-  // Volume keys: never counted. 'one' = exactly one pen press in the current state.
-  let lastAliasT = -1e9;
-  function alias(kind) {
-    const tn = now();
-    if (tn - lastAliasT < CFG.aliasGap) return;   // Button Mapper long-press auto-repeat
-    lastAliasT = tn;
-    // leave: teardown discards an open pen gesture (closing it could send a CONFIRM transcript)
-    if (kind === 'leave') { if (ModeController.mode === 'MIC') leaveVoice(); return; }
-    if (G.open) closeGesture();                   // a pen gesture in progress resolves first
-    openGesture(tn);
-    G.count = 1;
-    act(1);
-    closeGesture();                               // a complete one-press gesture
-  }
 
   /* ================================================== MediaSession wrapper */
   const INTERCEPT = ['play', 'pause', 'stop', 'nexttrack', 'previoustrack', 'seekforward'];
@@ -667,21 +529,13 @@
   // One entry point for MediaSession actions and media keydown events.
   // Returns true when this file consumed the action.
   function route(action) {
-    if (now() < G.swallowUntil) return true;
     const mic = ModeController.mode === 'MIC';
     if (action === 'play' || action === 'pause') {
       return mic && state() === 'RECORDING';       // never let playback start into the mic
     }
-    if (action === 'seekforward') {
-      if (!mic && relayH.seekforward) return false;
-      onKey(action); return true;                  // volume-up: THE counted key, +1 per press
-    }
-    if (action === 'stop') {
-      if (!mic) return false;                      // relay: today's stop
-      alias('leave'); return true;
-    }
-    if (action === 'previoustrack' || action === 'nexttrack') { onKey(action); return true; }
-    return false;
+    if (mic) { onKey(action); return true; }       // stop / nexttrack / previoustrack / seekforward
+    if (action === 'seekforward' && !relayH.seekforward) { onKey(action); return true; }   // relay entry
+    return false;                                  // RELAY: skip / replay / stop exactly as today
   }
 
   function dispatch(action) {
@@ -738,7 +592,6 @@
     CFG, init, state, mediaKey, keepCursor,
     enter: enterVoice,
     leave: leaveVoice,
-    _gesture: G,
     _dispatch: dispatch      // test hook: Mic._dispatch('nexttrack')() simulates a media key
   };
 })();
