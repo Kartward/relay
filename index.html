@@ -102,7 +102,7 @@ const DEFAULT_SYSTEM =
   'Answer in English unless the notes are clearly in another language, then mirror that. ' +
   'Answer in plain spoken prose meant to be read aloud. ' +
   'No markdown, no lists, no headings, no symbols, no emoji, no code, no links. ' +
-  'Use short sentences.';
+  'Use short sentences. Keep it under about 150 words.';
 
 const DEFAULTS = {
   topic: '', key: '',
@@ -445,8 +445,12 @@ async function chat(text) {
       { role: 'user', content: text }
     ]
   };
-  // The whole GPT-6 family rejects temperature/top_p; older models still want them.
-  if (!/^gpt-6/i.test(cfg.model)) body.temperature = 0.3;
+  // GPT-6 defaults to reasoning_effort=medium, which costs latency and rejects temperature.
+  // Force `none` where allowed; astra and 6.1-sol only accept `low`, and take no temperature.
+  const g6 = /^gpt-6/i.test(cfg.model);
+  const noTemp = /astra|6\.1-sol/i.test(cfg.model);
+  if (g6) body.reasoning_effort = noTemp ? 'low' : 'none';
+  if (!g6 || !noTemp) body.temperature = 0.3;
   const j = await openai('chat/completions', body, CHAT_TIMEOUT_MS, 'json');
   const out = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
   const clean = out ? cleanForSpeech(out) : '';
