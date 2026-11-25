@@ -37,6 +37,22 @@ function push(action) {
 
 document.getElementById('b').addEventListener('click', async () => {
   document.getElementById('b').textContent = 'LISTENING';
+  // Media keys only route to a page holding an active media session: keep audio alive.
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    await ctx.resume();
+    const o = ctx.createOscillator(), g = ctx.createGain();
+    g.gain.value = 0.00001; o.frequency.value = 30;
+    o.connect(g).connect(ctx.destination); o.start();
+    const rate = 8000, n = rate * 10, buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+    const w = (off, s) => { for (let i = 0; i < s.length; i++) v.setUint8(off + i, s.charCodeAt(i)); };
+    w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE');
+    w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+    v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+    w(36, 'data'); v.setUint32(40, n * 2, true);
+    const el = new Audio(URL.createObjectURL(new Blob([buf], { type: 'audio/wav' })));
+    el.loop = true; el.play().catch(() => {});
+  } catch (_) {}
   try { await speechSynthesis.speak(new SpeechSynthesisUtterance('go')); } catch (_) {}
   if (navigator.mediaSession) {
     for (const a of ['play', 'pause', 'stop', 'nexttrack', 'previoustrack', 'seekforward', 'seekbackward'])
