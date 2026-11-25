@@ -1,0 +1,797 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="theme-color" content="#0d0f12">
+<meta name="referrer" content="no-referrer">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'unsafe-inline'; connect-src https:; media-src blob:; img-src data:; worker-src 'self'; manifest-src 'self'; base-uri 'none'; form-action 'none'">
+<title>Voice Relay</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="data:,">
+<style>
+  :root { color-scheme: dark; --bg:#0d0f12; --panel:#1a1e24; --fg:#e8eaed; --mut:#9aa0a6; --acc:#5ec4ff; --bad:#ff6b6b; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; background:var(--bg); color:var(--fg);
+    font:20px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    -webkit-tap-highlight-color: transparent; touch-action: manipulation; }
+  .screen { position:fixed; inset:0; display:flex; flex-direction:column; }
+  .hidden { display:none !important; }
+
+  #start { z-index:10; align-items:center; justify-content:center; text-align:center;
+    background:var(--bg); cursor:pointer; user-select:none; -webkit-user-select:none; }
+  #start .big { font-size:2.4rem; font-weight:700; line-height:1.2; }
+  #start .hint { margin-top:1.5rem; color:var(--mut); }
+
+  #main { gap:14px; padding:16px 16px calc(64px + env(safe-area-inset-bottom)); }
+  #main button { flex:1; width:100%; }
+  #main .huge { flex:2; font-size:2.2rem; font-weight:700; }
+  .pair { display:flex; gap:14px; flex:1; }
+  .pair > button { flex:1; }
+
+  button { font:inherit; color:var(--fg); background:var(--panel); border:2px solid #2c323a;
+    border-radius:18px; min-height:72px; padding:0 1rem; }
+  button:active { background:#252b33; }
+  button.primary { background:#0f3a52; border-color:var(--acc); }
+
+  #settings { z-index:15; overflow-y:auto; background:var(--bg);
+    padding:16px 16px calc(80px + env(safe-area-inset-bottom)); gap:14px; }
+  #settings h1 { margin:0 0 4px; font-size:1.6rem; }
+  #settings label { display:flex; flex-direction:column; gap:6px; color:var(--mut); font-size:1rem; }
+  #settings input, #settings select, #settings textarea {
+    font:inherit; font-size:1.2rem; color:var(--fg); background:var(--panel);
+    border:2px solid #2c323a; border-radius:14px; padding:14px; min-height:64px; width:100%; }
+  #settings textarea { min-height:160px; resize:vertical; }
+  #settings .pair { flex:none; }
+
+  #statusline { position:fixed; left:0; right:0; bottom:0; z-index:20; pointer-events:none;
+    padding:10px 14px calc(10px + env(safe-area-inset-bottom));
+    font:14px/1.3 ui-monospace, Consolas, monospace; background:#000c; color:var(--mut);
+    white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  #sNet { color:var(--acc); }
+</style>
+</head>
+<body>
+
+<div id="start" class="screen" role="button" tabindex="0" aria-label="Tap anywhere to start">
+  <div class="big">Tap anywhere<br>to start</div>
+  <div class="hint">Voice Relay</div>
+</div>
+
+<main id="main" class="screen hidden">
+  <button id="bReplay" class="huge">Replay</button>
+  <div class="pair">
+    <button id="bStop">Stop</button>
+    <button id="bSkip">Skip</button>
+  </div>
+  <button id="bSettings">Settings</button>
+</main>
+
+<form id="settings" class="screen hidden" autocomplete="off" novalidate>
+  <h1>Settings</h1>
+  <label>ntfy topic
+    <input id="fTopic" spellcheck="false" autocapitalize="off" autocorrect="off"></label>
+  <label>OpenAI API key
+    <input id="fKey" type="password" spellcheck="false" autocapitalize="off" autocorrect="off"></label>
+  <label>ntfy server
+    <input id="fServer" type="url" spellcheck="false" autocapitalize="off"></label>
+  <label>Chat model
+    <input id="fModel" spellcheck="false" autocapitalize="off" autocorrect="off"></label>
+  <label>Voice
+    <select id="fVoice"></select></label>
+  <label>System prompt
+    <textarea id="fSystem" rows="6"></textarea></label>
+  <div class="pair">
+    <button type="submit" class="primary">Save</button>
+    <button type="button" id="bClose">Close</button>
+  </div>
+</form>
+
+<div id="statusline" aria-live="polite"><span id="sNet">offline</span> · <span id="sMain">Tap to start</span></div>
+
+<script>
+'use strict';
+
+/* =====================================================================
+   Constants and configuration
+   Config comes from the URL fragment (#t=<topic>&k=<key>) when present,
+   otherwise from localStorage. Path and query are never read.
+   ===================================================================== */
+const DEFAULT_SYSTEM =
+  'The text you receive ends with an instruction. Follow that instruction. ' +
+  'Reply in the same language as the instruction. ' +
+  'Answer in plain spoken prose meant to be read aloud. ' +
+  'No markdown, no lists, no headings, no symbols, no emoji, no code, no links. ' +
+  'Use short sentences.';
+
+const DEFAULTS = {
+  topic: '', key: '',
+  server: 'https://ntfy.sh',
+  model: 'gpt-4o-mini',
+  ttsModel: 'gpt-4o-mini-tts',
+  voice: 'alloy',
+  system: DEFAULT_SYSTEM
+};
+const VOICES = ['alloy','ash','ballad','coral','echo','fable','nova','onyx','sage','shimmer','verse'];
+const REPLAY_TOKEN = '__REPLAY__';
+const KEEPALIVE_TIMEOUT_MS = 90000;
+const CHAT_TIMEOUT_MS = 30000;
+const TTS_TIMEOUT_MS = 45000;
+const TTS_CHUNK = 3000;
+const LS = { cfg: 'vr.cfg', lastId: 'vr.lastId', seen: 'vr.seen' };
+
+const $ = (id) => document.getElementById(id);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function readJSON(key, fallback) {
+  try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
+  catch { return fallback; }
+}
+
+const cfg = loadConfig();
+
+function loadConfig() {
+  const c = Object.assign({}, DEFAULTS, readJSON(LS.cfg, {}));
+  if (location.hash.length > 1) {
+    const h = new URLSearchParams(location.hash.slice(1));
+    const t = (h.get('t') || '').trim();
+    const k = (h.get('k') || '').trim();
+    if (t) c.topic = t;
+    if (k) c.key = k;
+    if (t || k) localStorage.setItem(LS.cfg, JSON.stringify(c));
+    // Drop the fragment so the key does not stay in the address bar / history entry.
+    history.replaceState(null, '', location.pathname + location.search);
+  }
+  return c;
+}
+function saveConfig() { localStorage.setItem(LS.cfg, JSON.stringify(cfg)); }
+const configured = () => Boolean(cfg.topic && cfg.key);
+
+/* =====================================================================
+   Audio engine: one shared AudioContext + permanent keep-alive
+   ===================================================================== */
+const AudioEngine = {
+  ctx: null, out: null, keepOsc: null, keepEl: null,
+
+  // Must be called synchronously inside the start tap (user gesture).
+  unlock() {
+    if (this.ctx) return;
+    const ctx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'playback' });
+    this.ctx = ctx;
+    ctx.resume().catch(() => {});
+
+    this.out = ctx.createGain();
+    this.out.connect(ctx.destination);
+
+    // Keep-alive oscillator. It is started once and NEVER stopped: an always-running
+    // audio graph is what stops Chrome freezing this page with the screen off.
+    const osc = ctx.createOscillator();
+    const g = ctx.createGain();
+    osc.frequency.value = 30;
+    g.gain.value = 0.00001;
+    osc.connect(g).connect(ctx.destination);
+    osc.start();
+    this.keepOsc = osc;
+
+    // A looping, near-silent media element gives Android a real media session,
+    // so lock-screen controls and headset buttons reach the MediaSession handlers.
+    const el = new Audio();
+    el.src = URL.createObjectURL(silentWavBlob(10));
+    el.loop = true;
+    el.play().catch(() => {});
+    this.keepEl = el;
+
+    ctx.onstatechange = () => { if (ctx.state === 'suspended') ctx.resume().catch(() => {}); };
+    setInterval(() => this.guard(), 10000);
+  },
+
+  guard() {
+    if (!this.ctx) return;
+    if (this.ctx.state === 'suspended') this.ctx.resume().catch(() => {});
+    if (this.keepEl && this.keepEl.paused) this.keepEl.play().catch(() => {});
+  },
+
+  ensureRunning() { if (this.ctx && this.ctx.state !== 'running') this.ctx.resume().catch(() => {}); }
+};
+
+function silentWavBlob(seconds) {
+  const rate = 8000, n = rate * seconds;
+  const buf = new ArrayBuffer(44 + n * 2), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n * 2, true); w(8, 'WAVE');
+  w(12, 'fmt '); v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate * 2, true); v.setUint16(32, 2, true); v.setUint16(34, 16, true);
+  w(36, 'data'); v.setUint32(40, n * 2, true);
+  for (let i = 0; i < n; i++) v.setInt16(44 + i * 2, ((Math.random() * 3) | 0) - 1, true); // ±1 LSB dither
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+/* =====================================================================
+   Earcons: every state change is audible. They go through Web Audio,
+   so they work with the screen off. Silent until the start tap.
+   ===================================================================== */
+const Earcon = {
+  set: {
+    ready:      [[523, .09], [659, .09], [784, .14]],
+    connected:  [[784, .08]],
+    disconnect: [[660, .12], [440, .22]],
+    reconnect:  [[440, .12], [660, .22]],
+    received:   [[1047, .05]],
+    fallback:   [[330, .10], [0, .05], [330, .10]],
+    auth:       [[220, .15], [0, .05], [175, .30]],
+    error:      [[220, .25]],
+    paused:     [[392, .10], [294, .12]],
+    skip:       [[880, .05], [660, .05]],
+    replay:     [[660, .06], [880, .06]],
+    nothing:    [[262, .08]],
+    settings:   [[600, .06], [800, .06]]
+  },
+  play(name) {
+    const ctx = AudioEngine.ctx;
+    const seq = this.set[name];
+    if (!seq) { console.warn('[vr] missing earcon', name); return; }
+    if (!ctx) return; // nothing makes sound before the start tap
+    let t = ctx.currentTime + 0.02;
+    for (const [f, d] of seq) {
+      if (f) {
+        const o = ctx.createOscillator(), g = ctx.createGain();
+        o.type = 'sine'; o.frequency.value = f;
+        g.gain.setValueAtTime(0.0001, t);
+        g.gain.exponentialRampToValueAtTime(0.25, t + 0.01);
+        g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+        o.connect(g).connect(ctx.destination);
+        o.start(t); o.stop(t + d + 0.02);
+      }
+      t += d + 0.03;
+    }
+  }
+};
+
+/* =====================================================================
+   Status line. setNet / setStatus take a required sound:
+   an earcon name, or 'self' when the new state is itself audible (speech).
+   ===================================================================== */
+function announce(spanId, text, sound) {
+  $(spanId).textContent = text;
+  console.log('[vr]', text);
+  if (sound !== 'self') Earcon.play(sound);
+  updateMediaMeta();
+}
+const setNet = (text, sound) => announce('sNet', text, sound);
+const setStatus = (text, sound) => announce('sMain', text, sound);
+// Detail inside an already-announced state (retry countdowns etc.): no new sound.
+const detail = (spanId, text) => { $(spanId).textContent = text; console.log('[vr]', text); };
+
+/* =====================================================================
+   Device speech (fallback path and short UI words only)
+   ===================================================================== */
+function speakNow(text) {
+  if ('speechSynthesis' in window) speechSynthesis.speak(new SpeechSynthesisUtterance(text));
+  else Earcon.play('ready');
+}
+
+// Returns a stop function. done() is called exactly once.
+function speakUtter(text, done) {
+  let finished = false, timer = 0;
+  const fin = () => { if (finished) return; finished = true; clearTimeout(timer); done(); };
+  if (!('speechSynthesis' in window)) { Earcon.play('error'); timer = setTimeout(fin, 400); return fin; }
+  const u = new SpeechSynthesisUtterance(text);
+  u.onend = fin; u.onerror = fin;
+  timer = setTimeout(fin, 5000 + text.length * 90); // Chrome sometimes never fires onend
+  speechSynthesis.speak(u);
+  return () => { speechSynthesis.cancel(); fin(); };
+}
+
+/* =====================================================================
+   Dedupe store: ids persist, so nothing plays twice across reconnects/reloads
+   ===================================================================== */
+const Seen = {
+  ids: readJSON(LS.seen, []),
+  has(id) { return this.ids.includes(id); },
+  add(id) {
+    this.ids.push(id);
+    if (this.ids.length > 500) this.ids.splice(0, this.ids.length - 500);
+    localStorage.setItem(LS.seen, JSON.stringify(this.ids));
+  }
+};
+
+/* =====================================================================
+   Audio queue. Entries are promises resolving to item arrays, so API
+   calls can overlap while playback order stays the arrival order.
+   A deliberate Stop is respected: new arrivals queue behind it.
+   item = { kind:'clip', buffer, text } | { kind:'speech', text, notice? }
+   ===================================================================== */
+const Player = {
+  q: [], busy: false, paused: false, current: null, last: null,
+
+  enqueue(work, front = false) {
+    const entry = Promise.resolve(work).then(
+      (x) => [].concat(x || []),
+      (e) => { console.error(e); return [{ kind: 'speech', text: 'Something went wrong.', notice: true }]; }
+    );
+    if (front) this.q.unshift(entry); else this.q.push(entry);
+    this.pump();
+  },
+
+  async pump() {
+    if (this.busy || this.paused) return;
+    const entry = this.q.shift();
+    if (!entry) { this.idle(); return; }
+    this.busy = true;
+    const items = await entry;
+    for (let i = 0; i < items.length; i++) {
+      if (this.paused) { this.q.unshift(Promise.resolve(items.slice(i))); break; }
+      await this.play(items[i]);
+    }
+    this.busy = false;
+    this.pump();
+  },
+
+  play(item) {
+    return new Promise((resolve) => {
+      let ended = false, safety = 0;
+      const done = () => { if (ended) return; ended = true; clearTimeout(safety); this.current = null; resolve(); };
+      if (!item.notice) this.last = item; // cached in memory: replay costs no API call
+      setPlayback('playing');
+      setStatus(item.kind === 'clip' ? 'Speaking' : 'Speaking with device voice', 'self');
+
+      if (item.kind === 'clip') {
+        const ctx = AudioEngine.ctx;
+        AudioEngine.ensureRunning();
+        const src = ctx.createBufferSource();
+        src.buffer = item.buffer;
+        src.connect(AudioEngine.out);
+        src.onended = done;
+        src.start(ctx.currentTime + 0.15); // leave room for the preceding earcon
+        safety = setTimeout(done, (item.buffer.duration + 3) * 1000);
+        this.current = { stop: () => { try { src.stop(); } catch { done(); } } };
+      } else {
+        this.current = { stop: speakUtter(item.text, done) };
+      }
+    });
+  },
+
+  idle() {
+    setPlayback('paused'); // so a headset press means "play" = replay
+    setStatus('Listening', 'self');
+  },
+
+  // MediaSession play / headset press while idle: replay the last clip.
+  playPressed() {
+    if (this.last) { setStatus('Replaying last message', 'replay'); this.enqueue([this.last], true); }
+    else if (this.paused || this.q.length) { setStatus('Resuming', 'replay'); this.paused = false; this.pump(); }
+    else setStatus('Nothing to replay', 'nothing');
+  },
+
+  // MediaSession pause: stop audio now; queued messages are held, not dropped.
+  pausePressed() {
+    this.paused = true;
+    if (this.current) this.current.stop();
+    setPlayback('paused');
+    setStatus(this.q.length ? `Stopped, ${this.q.length} waiting` : 'Stopped', 'paused');
+  },
+
+  // MediaSession nexttrack: skip the current clip.
+  skip() {
+    if (this.current) { setStatus('Skipped', 'skip'); this.current.stop(); }
+    else if (this.paused && this.q.length) { setStatus('Resuming', 'replay'); this.paused = false; this.pump(); }
+    else setStatus('Nothing to skip', 'nothing');
+  },
+
+  toggle() { if (this.current) this.pausePressed(); else this.playPressed(); },
+
+  // Network body "__REPLAY__": replay in arrival order, no API call.
+  replayRequested() {
+    if (this.last) { setStatus('Replay requested', 'replay'); this.enqueue([this.last]); }
+    else setStatus('Nothing to replay', 'nothing');
+  }
+};
+
+/* =====================================================================
+   OpenAI calls with the failure ladder:
+   429 / 5xx / timeout / network → retry twice with jitter, then throw.
+   401 → throw immediately (caller speaks "API key rejected").
+   ===================================================================== */
+class HttpError extends Error {
+  constructor(status, body) { super('HTTP ' + status); this.status = status; this.body = body; }
+}
+
+async function openai(path, body, timeoutMs, as) {
+  let lastErr;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    if (attempt) {
+      const wait = 700 * 2 ** (attempt - 1) + Math.random() * 900;
+      detail('sMain', `Retry ${attempt} of 2 in ${(wait / 1000).toFixed(1)} s`);
+      await sleep(wait);
+    }
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    try {
+      const r = await fetch('https://api.openai.com/v1/' + path, {
+        method: 'POST',
+        headers: { 'Authorization': 'Bearer ' + cfg.key, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: ac.signal,
+        cache: 'no-store',
+        referrerPolicy: 'no-referrer'
+      });
+      if (r.ok) return as === 'json' ? await r.json() : await r.arrayBuffer();
+      const err = new HttpError(r.status, await r.text().catch(() => ''));
+      if (r.status === 429 || r.status >= 500) { lastErr = err; continue; }
+      throw err; // 401 and other 4xx: not retryable
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      lastErr = e; // AbortError (timeout), TypeError (network), bad JSON
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+  throw lastErr;
+}
+
+function cleanForSpeech(s) {
+  return String(s)
+    .replace(/```[\s\S]*?```/g, ' ')
+    .replace(/[*_#`>|~\[\]{}]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+async function chat(text) {
+  const j = await openai('chat/completions', {
+    model: cfg.model,
+    temperature: 0.3,
+    messages: [
+      { role: 'system', content: cfg.system || DEFAULT_SYSTEM },
+      { role: 'user', content: text }
+    ]
+  }, CHAT_TIMEOUT_MS, 'json');
+  const out = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
+  const clean = out ? cleanForSpeech(out) : '';
+  if (!clean) throw new Error('empty reply');
+  return clean;
+}
+
+// Split on sentence boundaries so no single /audio/speech call exceeds the input limit.
+function chunkForTts(text) {
+  const out = [];
+  let cur = '';
+  for (const part of text.match(/[^.!?]+[.!?]*\s*/g) || [text]) {
+    if (cur && cur.length + part.length > TTS_CHUNK) { out.push(cur.trim()); cur = ''; }
+    cur += part;
+    while (cur.length > TTS_CHUNK) { out.push(cur.slice(0, TTS_CHUNK).trim()); cur = cur.slice(TTS_CHUNK); }
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out.length ? out : [text];
+}
+
+async function speech(text) {
+  const mp3 = await openai('audio/speech', {
+    model: cfg.ttsModel,
+    voice: cfg.voice,
+    input: text,
+    response_format: 'mp3'
+  }, TTS_TIMEOUT_MS, 'buffer');
+  return AudioEngine.ctx.decodeAudioData(mp3);
+}
+
+function describe(e) {
+  if (e && e.status) return 'HTTP ' + e.status;
+  if (e && e.name === 'AbortError') return 'timeout';
+  return (e && e.message) || 'error';
+}
+
+function failure(e, text, stage) {
+  console.warn('[vr]', stage, e);
+  if (e && e.status === 401) {
+    setStatus('API key rejected', 'auth');
+    openSettings(false);
+    return [{ kind: 'speech', text: 'API key rejected', notice: true }, { kind: 'speech', text }];
+  }
+  setStatus(`${stage} failed (${describe(e)}), using device voice`, 'fallback');
+  return [{ kind: 'speech', text }]; // never silent
+}
+
+// raw text → chat completion → speech clips → item array
+async function produce(raw) {
+  let reply;
+  try { reply = await chat(raw); }
+  catch (e) { return failure(e, raw, 'Chat'); }
+  const items = [];
+  for (const part of chunkForTts(reply)) {
+    try { items.push({ kind: 'clip', buffer: await speech(part), text: part }); }
+    catch (e) { return items.length ? items.concat(failure(e, part, 'Speech')) : failure(e, reply, 'Speech'); }
+  }
+  return items;
+}
+
+/* =====================================================================
+   THE handler. Every source calls handle(text, id, source).
+   ===================================================================== */
+function handle(text, id, source = 'network') {
+  if (!id) id = source + '-' + Date.now() + '-' + Math.random().toString(36).slice(2);
+  if (Seen.has(id)) { console.log('[vr] duplicate ignored', id); return; }
+  Seen.add(id);
+  const body = String(text == null ? '' : text).trim();
+  if (!body) return;
+  if (body === REPLAY_TOKEN) { Player.replayRequested(); return; }
+  setStatus(`Message received (${source}), thinking`, 'received');
+  Player.enqueue(produce(body));
+  if (Player.paused) detail('sMain', `Message held, ${Player.q.length} waiting`);
+}
+
+/* =====================================================================
+   Sources. Contract: start(sink) / stop(); sink(text, id, sourceName).
+   ===================================================================== */
+const NetworkSource = {
+  name: 'network',
+  sink: null, es: null, dropped: false, lastBeat: 0, retryMs: 2000,
+  timer: null, wd: null, bound: false,
+
+  start(sink) {
+    this.sink = sink;
+    this.stop();
+    this.dropped = false;
+    this.retryMs = 2000;
+    // Session marker: since=<unix time> means "nothing older than this session".
+    // It is replaced by real message ids as they arrive.
+    localStorage.setItem(LS.lastId, String(Math.floor(Date.now() / 1000) - 5));
+    this.connect();
+    if (!this.wd) this.wd = setInterval(() => this.watchdog(), 5000);
+    if (!this.bound) {
+      this.bound = true;
+      addEventListener('online', () => {
+        if (this.dropped && this.sink) { this.retryMs = 2000; this.connect(); }
+      });
+    }
+  },
+
+  stop() {
+    clearTimeout(this.timer); this.timer = null;
+    if (this.es) { this.es.close(); this.es = null; }
+  },
+
+  url() {
+    let u = cfg.server.replace(/\/+$/, '') + '/' + encodeURIComponent(cfg.topic) + '/sse';
+    const since = localStorage.getItem(LS.lastId);
+    if (since) u += '?since=' + encodeURIComponent(since);
+    return u;
+  },
+
+  connect() {
+    this.stop();
+    const es = new EventSource(this.url());
+    this.es = es;
+    this.lastBeat = Date.now();
+    // "Connecting" is announced by the spoken "Ready" or the disconnect tone before it.
+    detail('sNet', this.dropped ? 'Reconnecting' : 'Connecting');
+
+    es.onopen = () => {
+      if (es !== this.es) return;
+      this.lastBeat = Date.now();
+      this.retryMs = 2000;
+      if (this.dropped) { this.dropped = false; setNet('Reconnected', 'reconnect'); }
+      else setNet('Connected', 'connected');
+    };
+
+    const onEvent = (e) => {
+      if (es !== this.es) return;
+      this.lastBeat = Date.now(); // any ntfy frame (open / keepalive / message) counts
+      if (!e.data) return;
+      let d; try { d = JSON.parse(e.data); } catch { return; }
+      if (d.event === 'message' && d.id) {
+        localStorage.setItem(LS.lastId, d.id);
+        this.sink(d.message, d.id, this.name);
+      }
+    };
+    for (const t of ['message', 'open', 'keepalive', 'poll_request']) es.addEventListener(t, onEvent);
+
+    // Native auto-reconnect would reuse a stale since=; manage reconnects ourselves.
+    es.onerror = () => { if (es === this.es) this.drop('Connection lost'); };
+  },
+
+  drop(reason) {
+    this.stop();
+    if (!this.dropped) { this.dropped = true; setNet(reason + ', reconnecting', 'disconnect'); }
+    const wait = this.retryMs + Math.random() * 1000;
+    this.retryMs = Math.min(this.retryMs * 2, 30000);
+    detail('sNet', `${reason}, retry in ${Math.round(wait / 1000)} s`);
+    this.timer = setTimeout(() => this.connect(), wait);
+  },
+
+  watchdog() {
+    if (this.es && Date.now() - this.lastBeat > KEEPALIVE_TIMEOUT_MS) this.drop('No keepalive for 90 s');
+  }
+};
+
+/* =====================================================================
+   >>> MicSource — STUB (mode 2). Not in SOURCES yet. <<<
+   Same contract as NetworkSource: start(sink) / stop(), and it must call
+   sink(transcript, 'mic-' + Date.now(), 'mic') — i.e. the same handle().
+   Plan:
+     1. navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true,
+        noiseSuppression: true, autoGainControl: true } })
+     2. AnalyserNode on AudioEngine.ctx → RMS voice-activity detection
+        (start after ~150 ms above threshold, end after ~800 ms below)
+     3. MediaRecorder per utterance (audio/webm;codecs=opus)
+     4. POST multipart/form-data to https://api.openai.com/v1/audio/transcriptions
+        (model gpt-4o-mini-transcribe) with the same retry ladder as openai()
+        (that helper is JSON-only; add a FormData variant)
+     5. Half-duplex: drop audio captured while Player.current is set, so the
+        phone never transcribes its own voice.
+   ===================================================================== */
+const MicSource = {
+  name: 'mic',
+  start(sink) { setStatus('Microphone mode is not built yet', 'error'); },
+  stop() {}
+};
+
+const SOURCES = [NetworkSource /* , MicSource */];
+
+/* =====================================================================
+   MediaSession + headset buttons
+   ===================================================================== */
+function setPlayback(state) {
+  if ('mediaSession' in navigator) navigator.mediaSession.playbackState = state;
+}
+
+function setupMediaSession() {
+  if (!('mediaSession' in navigator)) return;
+  const set = (action, fn) => { try { navigator.mediaSession.setActionHandler(action, fn); } catch {} };
+  set('play', () => Player.playPressed());
+  set('pause', () => Player.pausePressed());
+  set('stop', () => Player.pausePressed());
+  set('nexttrack', () => Player.skip());
+  set('previoustrack', () => Player.playPressed());
+  setPlayback('paused');
+  updateMediaMeta();
+}
+
+function updateMediaMeta() {
+  if (!started || !('mediaSession' in navigator) || typeof MediaMetadata === 'undefined') return;
+  navigator.mediaSession.metadata = new MediaMetadata({
+    title: 'Voice Relay',
+    artist: $('sNet').textContent + ' · ' + $('sMain').textContent
+  });
+}
+
+// Headset / keyboard media keys that arrive as key events instead of MediaSession actions.
+document.addEventListener('keydown', (e) => {
+  if (!started) return;
+  switch (e.key) {
+    case 'MediaPlayPause':    Player.toggle(); break;
+    case 'MediaPlay':         Player.playPressed(); break;
+    case 'MediaPause':
+    case 'MediaStop':         Player.pausePressed(); break;
+    case 'MediaTrackNext':    Player.skip(); break;
+    case 'MediaTrackPrevious':Player.playPressed(); break;
+    default: return;
+  }
+  e.preventDefault();
+});
+
+/* =====================================================================
+   Wake Lock (best effort; the audio keep-alive is the real mechanism)
+   ===================================================================== */
+let wakeLock = null;
+async function requestWakeLock() {
+  if (!('wakeLock' in navigator) || wakeLock || document.visibilityState !== 'visible') return;
+  try {
+    wakeLock = await navigator.wakeLock.request('screen');
+    wakeLock.addEventListener('release', () => { wakeLock = null; });
+  } catch (e) { console.log('[vr] wake lock unavailable', e); }
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || !started) return;
+  requestWakeLock();
+  AudioEngine.guard();
+  NetworkSource.watchdog();
+});
+
+/* =====================================================================
+   Settings screen
+   ===================================================================== */
+function fillVoices() {
+  const sel = $('fVoice');
+  sel.textContent = '';
+  const list = VOICES.includes(cfg.voice) ? VOICES : VOICES.concat(cfg.voice);
+  for (const v of list) {
+    const o = document.createElement('option');
+    o.value = v; o.textContent = v;
+    sel.appendChild(o);
+  }
+  sel.value = cfg.voice;
+}
+
+function openSettings(withSound = true) {
+  $('fTopic').value = cfg.topic;
+  $('fKey').value = cfg.key;
+  $('fServer').value = cfg.server;
+  $('fModel').value = cfg.model;
+  fillVoices();
+  $('fSystem').value = cfg.system;
+  $('settings').classList.remove('hidden');
+  if (withSound) Earcon.play('settings');
+}
+function closeSettings() { $('settings').classList.add('hidden'); }
+
+$('settings').addEventListener('submit', (e) => {
+  e.preventDefault();
+  const topic = $('fTopic').value.trim();
+  const key = $('fKey').value.trim();
+  if (!topic || !key) {
+    setStatus('Topic and API key are required', 'error');
+    speakNow('Topic and key are required');
+    return;
+  }
+  let server = $('fServer').value.trim() || DEFAULTS.server;
+  if (!/^https?:\/\//i.test(server)) server = 'https://' + server; // bare host is the common mistake
+  const netChanged = topic !== cfg.topic || server !== cfg.server;
+  Object.assign(cfg, {
+    topic, key, server,
+    model: $('fModel').value.trim() || DEFAULTS.model,
+    voice: $('fVoice').value || DEFAULTS.voice,
+    system: $('fSystem').value.trim() || DEFAULT_SYSTEM
+  });
+  saveConfig();
+  closeSettings();
+  setStatus('Settings saved', 'settings');
+  if (!running) { speakNow('Ready'); startSources(); }
+  else if (netChanged) NetworkSource.start(handle);
+});
+
+$('bClose').addEventListener('click', () => {
+  closeSettings();
+  setStatus(configured() ? 'Settings closed' : 'Settings needed: topic and API key', configured() ? 'settings' : 'error');
+});
+
+/* =====================================================================
+   Start: the whole viewport is one tap target. Nothing speaks before it.
+   ===================================================================== */
+let started = false, running = false;
+
+function startSources() {
+  running = true;
+  for (const s of SOURCES) s.start(handle);
+}
+
+function onStartTap() {
+  if (started) return;
+  started = true;
+  AudioEngine.unlock();          // 1. unlock audio + permanent keep-alive (inside the gesture)
+  requestWakeLock();
+  setupMediaSession();
+  $('start').classList.add('hidden');
+  $('main').classList.remove('hidden');
+
+  if (!configured()) {
+    speakNow('Settings needed');
+    setStatus('Settings needed: topic and API key', 'error');
+    openSettings(false);
+    return;
+  }
+  speakNow('Ready');             // 2. speak "Ready"
+  setStatus('Ready', 'self');
+  startSources();                // 3. connect
+}
+
+$('start').addEventListener('click', onStartTap);
+$('start').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onStartTap(); }
+});
+
+$('bReplay').addEventListener('click', () => Player.playPressed());
+$('bStop').addEventListener('click', () => Player.pausePressed());
+$('bSkip').addEventListener('click', () => Player.skip());
+$('bSettings').addEventListener('click', () => openSettings(true));
+
+/* ===================================================================== */
+detail('sMain', configured() ? 'Tap to start' : 'Tap to start, then enter settings');
+
+if ('serviceWorker' in navigator) {
+  navigator.serviceWorker.register('sw.js').catch((e) => console.log('[vr] sw failed', e));
+}
+</script>
+</body>
+</html>
