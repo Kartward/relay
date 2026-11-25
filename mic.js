@@ -14,9 +14,11 @@
  *     CONFIRM      1: discard, record again   2: SEND   3: read transcript again   4: leave
  *     THINKING     busy tick                3: repeat last reply   4: leave
  *   Volume keys (never counted)
- *     volume-up long  -> seekforward : exactly one pen press in the current state
- *                                      (in relay: enter voice mode and record)
- *     volume-down long-> stop        : leave voice mode (relay: today's stop)
+ *     volume-up SHORT -> seekforward : COUNTED, +1 per press — the only command key in use
+ *                                      (Button Mapper: short press = media fast-forward;
+ *                                      the S Pen sends nothing a page can observe)
+ *     volume-down     -> no mapping, a normal volume key. A media 'stop' from elsewhere
+ *                        (e.g. a headset) still leaves voice mode.
  *
  * Globals from index.html, looked up at call time only:
  *   handle, Player (q, busy, paused, current, last, enqueue, flush), AudioEngine (ctx, out),
@@ -37,7 +39,7 @@
     sliding: true,      // true: closes G after the LAST event, never later than cap after the first.
                         // false: closes exactly G after the first event.
     dedupe: 80,         // ms: same keycode repeated within this is ignored
-    maxCount: 4,        // counts above this act as this
+    maxCount: 4,        // counts above this act as this; 4 = leave voice mode, in every state
     aliasGap: 600,      // ms: volume-key alias repeats (Button Mapper auto-repeat) within this are ignored
 
     confirmMs: 20000,   // CONFIRM: unsent transcript is discarded this long after the read-back ends
@@ -572,8 +574,8 @@
       else w = 2;
       G.lastNextT = tn;
     } else {
-      w = 1;
-      G.lastPrevT = tn;
+      w = 1;                                      // previoustrack and seekforward
+      if (action === 'previoustrack') G.lastPrevT = tn;   // merge rule is for the pen's prev->next pair only
     }
 
     G.lastT = tn;
@@ -672,7 +674,7 @@
     }
     if (action === 'seekforward') {
       if (!mic && relayH.seekforward) return false;
-      alias('one'); return true;
+      onKey(action); return true;                  // volume-up: THE counted key, +1 per press
     }
     if (action === 'stop') {
       if (!mic) return false;                      // relay: today's stop
