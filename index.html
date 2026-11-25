@@ -145,11 +145,12 @@ const KEEPALIVE_TIMEOUT_MS = 90000;
 const CHAT_TIMEOUT_MS = 30000;
 const TTS_TIMEOUT_MS = 45000;
 const TTS_CHUNK = 3000;
-const WORD_GAP = 2; // insert an unspoken comma pause every N words
+const WORD_GAP = 1; // insert an unspoken punctuation pause every N words (1 = every word)
 
 function spaceOut(text) {
   if (!WORD_GAP) return text;
-  return text.split(/\s+/).map((w, i) => (i && i % WORD_GAP === 0 ? ',' + w : w)).join(' ');
+  const w = text.split(/\s+/).filter(Boolean).map((x) => x.replace(/[.,;:]+$/, ''));
+  return w.map((x, i) => (i < w.length - 1 ? x + '.' : x)).join(' ');
 }
 const LS = { cfg: 'vr.cfg', lastId: 'vr.lastId', seen: 'vr.seen' };
 
