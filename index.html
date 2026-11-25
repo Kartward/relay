@@ -560,6 +560,10 @@ async function produce(raw) {
   try { reply = await chat(raw); }
   catch (e) { return failure(e, raw, 'Chat'); }
   remember(raw, reply);
+  // Keep the answer retrievable later, without disturbing playback.
+  fetch(`${cfg.server.replace(/\/+$/, '')}/${encodeURIComponent(cfg.topic)}-out`, {
+    method: 'POST', body: reply, cache: 'no-store'
+  }).catch(() => {});
   const items = [];
   for (const part of chunkForTts(spaceOut(reply))) {
     try { items.push({ kind: 'clip', buffer: await speech(part), text: part }); }
