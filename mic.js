@@ -5,14 +5,16 @@
  * are kept, and so ?cal=1 binds its calibration handlers directly.
  *
  * Bindings (Button Mapper) — every action fires on the event
- *   seekforward   volume-up single    RELAY: enter voice mode + record
- *                                     CONFIRM: discard transcript, record again
- *                                     IDLE / SPEAKING: record (interrupts a reply)
- *                                     RECORDING: ignored   TRANSCRIBING / THINKING: busy tick
- *   nexttrack     volume-up double    CONFIRM: send to handle()        elsewhere in voice mode: busy tick
- *   previoustrack volume-down single  CONFIRM: read the transcript again   elsewhere in voice mode: busy tick
- *   stop          volume-down double  voice mode, any state: leave
- *   In RELAY, nexttrack / previoustrack / stop keep today's handlers (skip / replay / stop).
+ *   volume-up   single  seekforward    RECORD   RELAY: enter voice mode + record
+ *                                                CONFIRM: discard transcript, record again
+ *                                                IDLE / SPEAKING: record (interrupts a reply)
+ *                                                RECORDING: ignored   TRANSCRIBING / THINKING: busy tick
+ *   volume-up   double  nexttrack      SEND     CONFIRM only: send to handle(); elsewhere: busy tick
+ *   volume-down single  previoustrack  REPEAT   CONFIRM only: read the transcript again; elsewhere: busy tick
+ *   volume-down double  play / pause   LEAVE    voice mode, any state (a recording or an unsent
+ *                                                transcript is discarded; nothing is sent)
+ *   stop (e.g. a headset) is an alias for LEAVE; this phone's Button Mapper never delivers it.
+ *   In RELAY, play / pause / nexttrack / previoustrack / stop keep today's handlers.
  * A recording ends only on silence (silenceEndMs) or at the 60 s cap.
  *
  * Globals from index.html, looked up at call time only:
@@ -29,7 +31,7 @@
     dedupe: 80,         // ms: the same action delivered twice (MediaSession + keydown) within this is one event
 
     confirmMs: 20000,   // CONFIRM: unsent transcript is discarded this long after the read-back ends
-    confirmHint: 'Double-press volume up to send.',
+    confirmHint: 'Double-press volume up to send. Volume down to hear it again.',
     pulseMs: 1000,      // busy pulse interval while transcribing
     enterLeadMs: 340,   // relay -> voice: let the "voice on" tone finish before the start tone
 
@@ -174,7 +176,7 @@
   function announce(m, quiet) {
     if (m === 'MIC') {
       tone('voiceon'); buzz(40); show('Voice mode');
-      if (!quiet) say('Voice mode. Press volume up to talk.');
+      if (!quiet) say('Voice mode. Volume up to talk. Double-press volume down to leave.');
     } else {
       tone('voiceoff'); buzz([40, 60, 40]); show('Voice off, relay on');
       if (!quiet) say('Voice off.');
@@ -506,10 +508,6 @@
         if (s === 'CONFIRM') { repeatTranscript(); return; }
         busyTick();
         return;
-
-      case 'stop':                                                 // volume-down double
-        leaveVoice();
-        return;
     }
   }
 
@@ -528,12 +526,18 @@
 
   // One entry point for MediaSession actions and media keydown events.
   // Returns true when this file consumed the action.
+  let lastLeaveT = -1e9;
   function route(action) {
     const mic = ModeController.mode === 'MIC';
-    if (action === 'play' || action === 'pause') {
-      return mic && state() === 'RECORDING';       // never let playback start into the mic
+    if (action === 'play' || action === 'pause' || action === 'stop') {   // LEAVE (stop: headset alias)
+      // One press can arrive twice (MediaSession + keydown, or play then pause). The copy lands
+      // after the switch to RELAY and would hit today's Play / Pause / Stop; swallow it whatever the mode.
+      if (now() - lastLeaveT < CFG.dedupe) return true;
+      if (!mic) return false;                      // relay: today's play / pause / stop
+      lastLeaveT = now();
+      leaveVoice(); return true;                   // voice mode: leave, from any state
     }
-    if (mic) { onKey(action); return true; }       // stop / nexttrack / previoustrack / seekforward
+    if (mic) { onKey(action); return true; }       // nexttrack / previoustrack / seekforward
     if (action === 'seekforward' && !relayH.seekforward) { onKey(action); return true; }   // relay entry
     return false;                                  // RELAY: skip / replay / stop exactly as today
   }
