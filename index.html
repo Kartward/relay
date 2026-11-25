@@ -843,7 +843,20 @@ let started = false, running = false;
 function startSources() {
   running = true;
   for (const s of SOURCES) s.start(handle);
+  beat();
 }
+
+/* Only one page may listen; a second instance would speak every push twice. */
+const PAGE_ID = Math.random().toString(36).slice(2);
+const HB = 'vr.hb';
+function otherAlive() {
+  try {
+    const o = JSON.parse(localStorage.getItem(HB) || 'null');
+    return Boolean(o && o.id !== PAGE_ID && Date.now() - o.t < 6000);
+  } catch { return false; }
+}
+function beat() { localStorage.setItem(HB, JSON.stringify({ id: PAGE_ID, t: Date.now() })); }
+setInterval(() => { if (running) beat(); }, 2000);
 
 function onStartTap() {
   if (started) return;
@@ -858,6 +871,11 @@ function onStartTap() {
     speakNow('Settings needed');
     setStatus('Settings needed: topic and API key', 'error');
     openSettings(false);
+    return;
+  }
+  if (otherAlive()) {
+    speakNow('Already running elsewhere');
+    setStatus('Already running elsewhere', 'error');
     return;
   }
   speakNow('Ready');             // 2. speak "Ready"
