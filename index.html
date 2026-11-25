@@ -733,8 +733,40 @@ const MicSource = {
 const SOURCES = [NetworkSource /* , MicSource */];
 
 /* =====================================================================
-   MediaSession + headset buttons
+   Calibration mode (?cal=1): logs media events and pushes the gesture,
+   with the gaps between presses, to <topic>-cal. Nothing else runs.
    ===================================================================== */
+const CAL = new URLSearchParams(location.search).get('cal') === '1';
+let calFirst = 0, calLast = 0, calSeq = [], calTimer = 0;
+
+function calLog(action) {
+  const now = performance.now();
+  if (!calFirst || now - calLast > 700) {
+    if (calSeq.length) calFlush('gap');
+    calFirst = now;
+    calSeq = [];
+    $('sMain').textContent = 'gesture…';
+  }
+  calSeq.push({ a: action, d: Math.round(now - calLast) });
+  calLast = now;
+  clearTimeout(calTimer);
+  calTimer = setTimeout(() => calFlush('closed'), 700);
+  speakNow(calSeq.map((x) => x.a).join(' '));
+}
+
+function calFlush(why) {
+  if (!calSeq.length) return;
+  const row = { why, t: Date.now(), ev: calSeq };
+  calSeq = [];
+  $('sMain').textContent = `logged ${row.ev.length}`;
+  if (cfg.topic) {
+    fetch(`${cfg.server.replace(/\/+$/, '')}/${encodeURIComponent(cfg.topic)}-cal`, {
+      method: 'POST', body: JSON.stringify(row), cache: 'no-store'
+    }).catch(() => {});
+  }
+}
+
+
 function setPlayback(state) {
   if ('mediaSession' in navigator) navigator.mediaSession.playbackState = state;
 }
@@ -742,6 +774,12 @@ function setPlayback(state) {
 function setupMediaSession() {
   if (!('mediaSession' in navigator)) return;
   const set = (action, fn) => { try { navigator.mediaSession.setActionHandler(action, fn); } catch {} };
+  if (CAL) {
+    for (const a of ['play', 'pause', 'stop', 'nexttrack', 'previoustrack', 'seekforward'])
+      set(a, () => calLog(a));
+    setPlayback('paused');
+    return;
+  }
   set('play', () => Player.playPressed());
   set('pause', () => Player.pausePressed());
   set('stop', () => Player.pausePressed());
