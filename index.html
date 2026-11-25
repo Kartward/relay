@@ -470,7 +470,15 @@ function cleanForSpeech(s) {
     .trim();
 }
 
-const CONTEXT = []; // last two exchanges, memory only, cleared on reload
+const CONTEXT = []; // last two exchanges, cut to a fixed character budget
+const CTX_CHARS = 2500;
+
+function remember(req, reply) {
+  const clip = (s, n) => (s.length > n ? s.slice(0, n) : s);
+  CONTEXT.push({ req: clip(req, 400), reply: clip(reply, 800) });
+  const size = () => CONTEXT.reduce((a, c) => a + c.req.length + c.reply.length, 0);
+  while ((CONTEXT.length > 2 || size() > CTX_CHARS) && CONTEXT.length) CONTEXT.shift();
+}
 
 async function chat(text) {
   const body = {
@@ -543,8 +551,7 @@ async function produce(raw) {
   let reply;
   try { reply = await chat(raw); }
   catch (e) { return failure(e, raw, 'Chat'); }
-  CONTEXT.push({ req: raw, reply });
-  if (CONTEXT.length > 2) CONTEXT.shift();
+  remember(raw, reply);
   const items = [];
   for (const part of chunkForTts(reply)) {
     try { items.push({ kind: 'clip', buffer: await speech(part), text: part }); }
