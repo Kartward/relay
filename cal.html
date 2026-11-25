@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>cal</title>
+<style>
+ body{margin:0;height:100vh;background:#111;color:#eee;font:22px system-ui;display:flex;
+      align-items:center;justify-content:center;text-align:center;flex-direction:column;gap:1em}
+ #b{font-size:1.6em;padding:1em 1.4em;border:0;border-radius:.5em;background:#2d7;color:#012}
+ #s{font:14px ui-monospace;opacity:.7;white-space:pre-wrap;padding:0 1em}
+</style>
+<button id=b>TAP, THEN PRESS THE PEN</button>
+<div id=s>—</div>
+<script>
+const q = new URLSearchParams(location.search);
+let topic = q.get('t') || '';
+if (!topic) { try { topic = (JSON.parse(localStorage.getItem('vr.cfg') || '{}').topic) || ''; } catch (_) {} }
+let base = q.get('s') || 'https://ntfy.sh';
+let last = 0;
+const log = [];
+
+function push(action) {
+  const now = performance.now();
+  const d = last ? Math.round(now - last) : -1;
+  last = now;
+  log.push(action + '@' + d);
+  document.getElementById('s').textContent = log.slice(-12).join('  ');
+  try { speechSynthesis.speak(new SpeechSynthesisUtterance(action)); } catch (_) {}
+  if (topic) {
+    fetch(base.replace(/\/+$/, '') + '/' + encodeURIComponent(topic) + '-cal', {
+      method: 'POST', cache: 'no-store',
+      body: JSON.stringify({ a: action, d, wall: Date.now() })
+    }).catch(() => {});
+  } else {
+    document.getElementById('s').textContent += '\nNO TOPIC';
+  }
+}
+
+document.getElementById('b').addEventListener('click', async () => {
+  document.getElementById('b').textContent = 'LISTENING';
+  try { await speechSynthesis.speak(new SpeechSynthesisUtterance('go')); } catch (_) {}
+  if (navigator.mediaSession) {
+    for (const a of ['play', 'pause', 'stop', 'nexttrack', 'previoustrack', 'seekforward', 'seekbackward'])
+      try { navigator.mediaSession.setActionHandler(a, () => push(a)); } catch (_) {}
+  }
+  document.getElementById('b').textContent = 'PRESS NOW  (topic: ' + (topic ? 'set' : 'MISSING') + ')';
+});
+</script>
