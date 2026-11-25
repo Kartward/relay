@@ -99,7 +99,7 @@
    ===================================================================== */
 const DEFAULT_SYSTEM =
   'The text you receive ends with an instruction. Follow that instruction. ' +
-  'Reply in the same language as the instruction. ' +
+  'Answer in English unless the notes are clearly in another language, then mirror that. ' +
   'Answer in plain spoken prose meant to be read aloud. ' +
   'No markdown, no lists, no headings, no symbols, no emoji, no code, no links. ' +
   'Use short sentences.';
@@ -107,7 +107,7 @@ const DEFAULT_SYSTEM =
 const DEFAULTS = {
   topic: '', key: '',
   server: 'https://ntfy.sh',
-  model: 'gpt-4o-mini',
+  model: 'gpt-6.1-terra',
   ttsModel: 'gpt-4o-mini-tts',
   voice: 'alloy',
   system: DEFAULT_SYSTEM
@@ -438,14 +438,16 @@ function cleanForSpeech(s) {
 }
 
 async function chat(text) {
-  const j = await openai('chat/completions', {
+  const body = {
     model: cfg.model,
-    temperature: 0.3,
     messages: [
       { role: 'system', content: cfg.system || DEFAULT_SYSTEM },
       { role: 'user', content: text }
     ]
-  }, CHAT_TIMEOUT_MS, 'json');
+  };
+  // GPT-6.2 throws these away; older models still want them.
+  if (!/^gpt-6\.2/i.test(cfg.model)) body.temperature = 0.3;
+  const j = await openai('chat/completions', body, CHAT_TIMEOUT_MS, 'json');
   const out = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
   const clean = out ? cleanForSpeech(out) : '';
   if (!clean) throw new Error('empty reply');
