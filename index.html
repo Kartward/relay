@@ -136,7 +136,7 @@ const DEFAULTS = {
   model: 'gpt-6.1-terra',
   ttsModel: 'gpt-4o-mini-tts',
   voice: 'alloy',
-  ttsSpeed: 0.75,
+  ttsSpeed: 0.5,
   system: DEFAULT_SYSTEM
 };
 const VOICES = ['alloy','ash','ballad','coral','echo','fable','nova','onyx','sage','shimmer','verse'];
@@ -145,7 +145,7 @@ const KEEPALIVE_TIMEOUT_MS = 90000;
 const CHAT_TIMEOUT_MS = 30000;
 const TTS_TIMEOUT_MS = 45000;
 const TTS_CHUNK = 3000;
-const WORD_GAP = 3; // insert an unspoken comma pause every N words
+const WORD_GAP = 2; // insert an unspoken comma pause every N words
 
 function spaceOut(text) {
   if (!WORD_GAP) return text;
@@ -528,6 +528,7 @@ async function speech(text) {
   const mp3 = await openai('audio/speech', {
     model: cfg.ttsModel,
     voice: cfg.voice,
+    ...(/(gpt-4o)/i.test(cfg.ttsModel) ? { instructions: 'Speak slowly and clearly, with a clear pause between words.' } : {}),
     speed: clampSpeed(cfg.ttsSpeed),
     input: text,
     response_format: 'mp3'
