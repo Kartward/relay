@@ -157,7 +157,7 @@ const KEEPALIVE_TIMEOUT_MS = 90000;
 const CHAT_TIMEOUT_MS = 30000;
 const TTS_TIMEOUT_MS = 45000;
 const TTS_CHUNK = 3000;
-const GAP_MS = 450; // real silence inserted before every segment
+const GAP_MS = 700; // real silence inserted before every segment
 const WORD_GAP = 1; // insert an unspoken punctuation pause every N words (1 = every word)
 
 function spaceOut(text) {
@@ -529,7 +529,7 @@ async function chat(text) {
 function chunkForTts(text) {
   const words = text.split(/\s+/).filter(Boolean);
   const out = [];
-  const per = 3;
+  const per = 1;
   for (let i = 0; i < words.length; i += per) {
     let part = words.slice(i, i + per).join(' ');
     while (part.length > TTS_CHUNK) { out.push(part.slice(0, TTS_CHUNK).trim()); part = part.slice(TTS_CHUNK); }
@@ -590,7 +590,7 @@ async function produce(raw) {
       try { clips[i] = await speech(parts[i]); } catch (e) { clips[i] = null; }
     }
   };
-  await Promise.all(Array.from({ length: 6 }, worker));
+  await Promise.all(Array.from({ length: 8 }, worker));
   parts.forEach((p, i) => {
     if (clips[i]) items.push({ kind: 'clip', buffer: clips[i], text: p, set: items });
   });
