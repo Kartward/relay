@@ -157,6 +157,7 @@ const KEEPALIVE_TIMEOUT_MS = 90000;
 const CHAT_TIMEOUT_MS = 30000;
 const TTS_TIMEOUT_MS = 45000;
 const TTS_CHUNK = 3000;
+const GAP_MS = 500; // real silence inserted before every segment
 const WORD_GAP = 1; // insert an unspoken punctuation pause every N words (1 = every word)
 
 function spaceOut(text) {
@@ -394,7 +395,7 @@ const Player = {
         src.buffer = item.buffer;
         src.connect(AudioEngine.out);
         src.onended = done;
-        src.start(ctx.currentTime + 0.15); // leave room for the preceding earcon
+        src.start(ctx.currentTime + 0.15 + GAP_MS / 1000); // leave room for the preceding earcon
         safety = setTimeout(done, (item.buffer.duration + 3) * 1000);
         this.current = { stop: () => { try { src.stop(); } catch { done(); } } };
       } else {
@@ -524,20 +525,20 @@ async function chat(text) {
   return clean;
 }
 
-// Split on sentence boundaries so no single /audio/speech call exceeds the input limit.
+// Short groups so real silence can be inserted between them; each still under the input limit.
 function chunkForTts(text) {
+  const words = text.split(/\s+/).filter(Boolean);
   const out = [];
-  let cur = '';
-  for (const part of text.match(/[^.!?]+[.!?]*\s*/g) || [text]) {
-    if (cur && cur.length + part.length > TTS_CHUNK) { out.push(cur.trim()); cur = ''; }
-    cur += part;
-    while (cur.length > TTS_CHUNK) { out.push(cur.slice(0, TTS_CHUNK).trim()); cur = cur.slice(TTS_CHUNK); }
+  const per = 3;
+  for (let i = 0; i < words.length; i += per) {
+    let part = words.slice(i, i + per).join(' ');
+    while (part.length > TTS_CHUNK) { out.push(part.slice(0, TTS_CHUNK).trim()); part = part.slice(TTS_CHUNK); }
+    if (part) out.push(part);
   }
-  if (cur.trim()) out.push(cur.trim());
   return out.length ? out : [text];
 }
 
-async function speech(text) {
+async function speech(text, via) {
   const mp3 = await openai('audio/speech', {
     model: cfg.ttsModel,
     voice: cfg.voice,
@@ -580,10 +581,12 @@ async function produce(raw) {
     method: 'POST', body: reply, cache: 'no-store'
   }).catch(() => {});
   const items = [];
-  for (const part of chunkForTts(spaceOut(reply))) {
-    try { items.push({ kind: 'clip', buffer: await speech(part), text: part }); }
-    catch (e) { return items.length ? items.concat(failure(e, part, 'Speech')) : failure(e, reply, 'Speech'); }
-  }
+  const parts = chunkForTts(spaceOut(reply));
+  const clips = await Promise.all(parts.map((p) => speech(p).catch(() => null)));
+  parts.forEach((p, i) => {
+    if (clips[i]) items.push({ kind: 'clip', buffer: clips[i], text: p });
+  });
+  if (!items.length) return failure(new Error('speech failed'), reply, 'Speech');
   return items;
 }
 
