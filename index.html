@@ -384,7 +384,7 @@ const Player = {
     return new Promise((resolve) => {
       let ended = false, safety = 0;
       const done = () => { if (ended) return; ended = true; clearTimeout(safety); this.current = null; resolve(); };
-      if (!item.notice) this.last = item; // cached in memory: replay costs no API call
+      if (!item.notice) this.last = item.set || item; // cached in memory: replay costs no API call
       setPlayback('playing');
       setStatus(item.kind === 'clip' ? 'Speaking' : 'Speaking with device voice', 'self');
 
@@ -584,7 +584,7 @@ async function produce(raw) {
   const parts = chunkForTts(spaceOut(reply));
   const clips = await Promise.all(parts.map((p) => speech(p).catch(() => null)));
   parts.forEach((p, i) => {
-    if (clips[i]) items.push({ kind: 'clip', buffer: clips[i], text: p });
+    if (clips[i]) items.push({ kind: 'clip', buffer: clips[i], text: p, set: items });
   });
   if (!items.length) return failure(new Error('speech failed'), reply, 'Speech');
   return items;
