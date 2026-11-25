@@ -529,7 +529,7 @@ async function chat(text) {
 function chunkForTts(text) {
   const words = text.split(/\s+/).filter(Boolean);
   const out = [];
-  const per = 1;
+  const per = 2;
   for (let i = 0; i < words.length; i += per) {
     let part = words.slice(i, i + per).join(' ');
     while (part.length > TTS_CHUNK) { out.push(part.slice(0, TTS_CHUNK).trim()); part = part.slice(TTS_CHUNK); }
