@@ -41,7 +41,7 @@
     sttModel: 'gpt-4o-mini-transcribe',
     sttTimeout: 15000,
     sttBackoff: [1000, 3000], // 2 retries, network / 429 / 5xx only
-    language: ''              // e.g. 'en'; empty = auto-detect
+    language: 'en'            // ISO-639-1 for transcription; 'en' only, never auto-detect
   };
 
   /* ---------------------------------------------------------------- helpers */
