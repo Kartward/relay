@@ -1,12 +1,26 @@
-/* mic.js — voice input mode + weighted press counter (pen button / volume keys).
+/* mic.js — voice input mode + weighted press counter (pen button), volume-key aliases.
  *
  * Loaded by index.html BEFORE its inline script: it wraps
  * navigator.mediaSession.setActionHandler so setupMediaSession()'s relay handlers
- * are kept and called unchanged in RELAY mode, and so ?cal=1 binds them directly.
+ * are kept, and so ?cal=1 binds its calibration handlers directly.
+ *
+ * Commands
+ *   Pen (counted: previoustrack +1, nexttrack +2, merge / dedupe / window as before; >4 acts as 4)
+ *     RELAY        1: enter voice mode and record        (a gesture starting with nexttrack = today's skip)
+ *     IDLE         1: record   2: "nothing to send"   3: repeat last reply   4: leave
+ *     SPEAKING     1: stop speech, record   2: "nothing to send"   3: repeat   4: leave
+ *     RECORDING    1: stop early -> transcribe          4: discard, leave
+ *     TRANSCRIBING busy tick                            4: discard, leave
+ *     CONFIRM      1: discard, record again   2: SEND   3: read transcript again   4: leave
+ *     THINKING     busy tick                3: repeat last reply   4: leave
+ *   Volume keys (never counted)
+ *     volume-up long  -> seekforward : exactly one pen press in the current state
+ *                                      (in relay: enter voice mode and record)
+ *     volume-down long-> stop        : leave voice mode (relay: today's stop)
  *
  * Globals from index.html, looked up at call time only:
  *   handle, Player (q, busy, paused, current, last, enqueue, flush), AudioEngine (ctx, out),
- *   setStatus, speakNow, cfg (key), CAL, RelayHooks (ready, stop, start)
+ *   setStatus, speakNow, speakUtter, cfg (key), CAL, RelayHooks (ready, stop, start)
  *
  * Exposes: window.ModeController, window.Mic
  */
@@ -23,10 +37,17 @@
     sliding: true,      // true: closes G after the LAST event, never later than cap after the first.
                         // false: closes exactly G after the first event.
     dedupe: 80,         // ms: same keycode repeated within this is ignored
+    maxCount: 4,        // counts above this act as this
+    aliasGap: 600,      // ms: volume-key alias repeats (Button Mapper auto-repeat) within this are ignored
+
+    confirmMs: 20000,   // CONFIRM: unsent transcript is discarded this long after the read-back ends
+    confirmHint: 'Press twice to send.',
+    pulseMs: 1000,      // busy pulse interval while transcribing
+    enterLeadMs: 340,   // relay -> voice: let the "voice on" tone finish before the start tone
 
     noSpeechMs: 5000,   // no speech onset within this => cancel, nothing uploaded
-    silenceEndMs: 1500, // trailing silence after speech => stop and send
-    maxMs: 60000,       // hard cap; still sends
+    silenceEndMs: 1500, // trailing silence after speech => stop and transcribe
+    maxMs: 60000,       // hard cap; still transcribes
     warnMs: 50000,      // vibration warning
     minSpeechMs: 300,   // less detected speech than this => not uploaded
     calibMs: 250,       // noise-floor calibration at recording start
@@ -66,15 +87,17 @@
   /* ------------------------------------------------------------------ tones
    * Through AudioEngine.out (the master gain), so they are silent while recording. */
   const TONES = {
-    start:    [[880, 0, 0.06]],                         // count 1: recording starts
-    repeat:   [[660, 0, 0.04], [660, 0.09, 0.04]],      // count 2: two ticks
-    voiceoff: [[660, 0, 0.12], [440, 0.12, 0.20]],      // count 3 / stop: falling
-    voiceon:  [[440, 0, 0.12], [660, 0.12, 0.20]],      // entering voice mode: rising
-    stopped:  [[330, 0, 0.06]],                         // recorder stopped
-    sent:     [[520, 0, 0.05], [780, 0.07, 0.08]],      // transcript committed to handle()
-    soft:     [[300, 0, 0.05], [300, 0.10, 0.05]],      // nothing heard / empty
-    busy:     [[200, 0, 0.05]],                         // press ignored while busy
-    error:    [[160, 0, 0.28]]                          // any failure (followed by speech)
+    start:        [[880, 0, 0.06]],                                       // recording starts
+    transcribing: [[440, 0, 0.05], [554, 0.08, 0.05], [659, 0.16, 0.08]], // recording ended, wait
+    busy:         [[200, 0, 0.05]],                                       // busy pulse / ignored press
+    confirm:      [[659, 0, 0.05], [988, 0.07, 0.09]],                    // transcript ready, read-back follows
+    sent:         [[520, 0, 0.05], [780, 0.07, 0.08]],                    // accepted, sent to handle()
+    expired:      [[494, 0, 0.06], [349, 0.09, 0.10]],                    // CONFIRM timed out, discarded
+    repeat:       [[660, 0, 0.04], [660, 0.09, 0.04]],                    // repeat / read again
+    voiceon:      [[440, 0, 0.12], [660, 0.12, 0.20]],                    // entering voice mode: rising
+    voiceoff:     [[660, 0, 0.12], [440, 0.12, 0.20]],                    // leaving voice mode: falling
+    soft:         [[300, 0, 0.05], [300, 0.10, 0.05]],                    // nothing heard / nothing to send
+    error:        [[160, 0, 0.28]]                                        // any failure (followed by speech)
   };
   function tone(name) {
     const seq = TONES[name] || [];
@@ -98,6 +121,7 @@
     return Math.round(end * 1000) + 10;
   }
   function fail(text) { tone('error'); buzz([80, 60, 80]); show(text); say(text); }
+  function soft(text) { tone('soft'); buzz(15); show(text); say(text); }
 
   /* ------------------------------------------------------- master gain mute */
   let savedGain = null;
@@ -138,52 +162,61 @@
     valid(tok) { return !!tok && tok.epoch === this.epoch && this.allows(tok.source); },
     invalidate() { this.epoch++; },
 
-    set(target) {
+    // quiet: tone + vibration + status only (used when a recording starts straight away)
+    set(target, quiet) {
       if (isCal() || (target !== 'MIC' && target !== 'RELAY')) return;
-      if (target === this.mode) { announce(target); return; }      // idempotent: re-announce only
+      if (target === this.mode) { announce(target, quiet); return; }   // idempotent: re-announce only
       if (target === 'MIC') {
         if (safe(() => RelayHooks.ready()) === false) { fail('Not ready yet.'); return; }
         safe(() => RelayHooks.stop());          // 1. close stream + timers, rewind unplayed messages
         this.invalidate();                      // 2. in-flight relay work is dropped
         flushPlayback();                        // 3. cancel speech, clear relay queue
         this.mode = 'MIC'; safe(() => localStorage.setItem(LS_MODE, 'MIC'));
-        announce('MIC');
+        announce('MIC', quiet);
       } else {
-        Voice.teardown();                       // gesture, recording, uploads
+        Voice.teardown();                       // gesture, recording, transcription, CONFIRM
         this.invalidate();                      // pending mic replies are dropped
         flushPlayback();
         this.mode = 'RELAY'; safe(() => localStorage.setItem(LS_MODE, 'RELAY'));
-        announce('RELAY');
+        announce('RELAY', quiet);
         safe(() => RelayHooks.start());         // reconnect from the kept ?since= cursor
       }
     }
   };
-  function announce(m) {
-    if (m === 'MIC') { tone('voiceon'); buzz(40); show('Voice mode'); say('Voice mode. Press once to talk.'); }
-    else { tone('voiceoff'); buzz([40, 60, 40]); show('Voice off, relay on'); say('Voice off.'); }
+  function announce(m, quiet) {
+    if (m === 'MIC') {
+      tone('voiceon'); buzz(40); show('Voice mode');
+      if (!quiet) say('Voice mode. Press once to talk.');
+    } else {
+      tone('voiceoff'); buzz([40, 60, 40]); show('Voice off, relay on');
+      if (!quiet) say('Voice off.');
+    }
   }
 
   /* =========================================================== Voice (takes) */
   let take = null;               // the take that is opening or recording
-  const inflight = new Set();    // takes being transcribed / awaiting commit
-  let turn = null;               // last committed mic turn: { epoch }
+  const inflight = new Set();    // takes stopping / being transcribed
+  let pending = null;            // CONFIRM: { text, id, timer, stop, quiet }
+  let turn = null;               // last accepted mic turn: { epoch }
 
   function state() {
+    if (ModeController.mode !== 'MIC') return 'RELAY';
     if (take && (take.phase === 'opening' || take.phase === 'recording')) return 'RECORDING';
-    if (inflight.size > 0) return 'BUSY';
+    if (inflight.size > 0) return 'TRANSCRIBING';
+    if (pending) return 'CONFIRM';
     if (safe(() => Player.current)) return 'SPEAKING';
     const thinking = turn && turn.epoch === ModeController.epoch &&
       safe(() => !Player.paused && (Player.busy || Player.q.length > 0));
-    return thinking ? 'BUSY' : 'IDLE';
+    return thinking ? 'THINKING' : 'IDLE';
   }
 
   function newTake() {
     return {
       id: Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      phase: 'opening', cancelled: false, done: false,
+      phase: 'opening', cancelled: false,
       stream: null, rec: null, chunks: [], mime: '', ext: '', stopped: null,
-      speechMs: 0, heard: false, noVad: false, vad: null, timers: [],
-      ac: new AbortController(), commitReady: false, text: undefined, err: null
+      speechMs: 0, heard: false, noVad: false, vad: null, timers: [], pulse: 0,
+      ac: new AbortController()
     };
   }
 
@@ -211,11 +244,12 @@
   }
 
   // Runs synchronously up to its first await: `take` is set before this returns.
-  async function startTake() {
-    flushPlayback();
+  async function startTake(leadMs) {
+    flushPlayback();               // also stops a CONFIRM read-back
     ModeController.invalidate();   // nothing older may start playing into the mic
     const t = take = newTake();
     show('Recording');
+    if (leadMs) { await sleep(leadMs); if (t.cancelled) return; }
     const toneMs = tone('start'); buzz(30);
     let gum;
     try {
@@ -286,40 +320,50 @@
     t.vad = null;
   }
   function stopTracks(t) { safe(() => t.stream && t.stream.getTracks().forEach((x) => x.stop())); }
-  function clearTimers(t) { t.timers.forEach(clearTimeout); t.timers = []; }
+  function clearTimers(t) { t.timers.forEach(clearTimeout); t.timers = []; clearInterval(t.pulse); t.pulse = 0; }
   function cleanupTake(t) {
     clearTimers(t); stopVad(t); stopTracks(t); unmute();
     t.cancelled = true; if (take === t) take = null;
+    inflight.delete(t);
   }
 
-  // reason: 'accept' (press; commit waits for gesture close) | 'silence' | 'cap' | 'nospeech'
+  // reason: 'press' | 'silence' | 'cap' | 'nospeech'. Every path ends audibly in TRANSCRIBING,
+  // CONFIRM, or voice idle with a spoken reason.
   async function finishTake(t, reason) {
     if (!t || t.cancelled) return;
     if (t.phase === 'opening') {                // pressed before the mic was even live
-      cleanupTake(t); tone('soft'); show("Didn't catch that"); say("Didn't catch that."); return;
+      cleanupTake(t); soft("Didn't catch that."); return;
     }
     if (t.phase !== 'recording') return;
     t.phase = 'stopping';
     if (take === t) take = null;
+    inflight.add(t);                            // TRANSCRIBING from this moment: presses get the busy tick
     clearTimers(t); stopVad(t);
     safe(() => { if (t.rec.state !== 'inactive') t.rec.stop(); });
     await Promise.race([t.stopped, sleep(2000)]);
     stopTracks(t); unmute();
-    if (t.cancelled) return;
-    tone('stopped');
+    if (t.cancelled) { inflight.delete(t); return; }
 
-    if (reason === 'nospeech') { t.done = true; tone('soft'); show("Didn't hear anything"); say("Didn't hear anything."); return; }
-    if (!t.noVad && t.speechMs < CFG.minSpeechMs) { t.done = true; tone('soft'); show("Didn't catch that"); say("Didn't catch that."); return; }
+    if (reason === 'nospeech') { inflight.delete(t); soft("Didn't hear anything."); return; }
+    if (!t.noVad && t.speechMs < CFG.minSpeechMs) { inflight.delete(t); soft("Didn't catch that."); return; }
 
     const type = ((t.rec && t.rec.mimeType) || t.mime).split(';')[0];
     const blob = new Blob(t.chunks, { type: type });
     t.phase = 'transcribing';
-    inflight.add(t);
     show('Transcribing');
-    if (reason !== 'accept') t.commitReady = true;   // auto-ends commit as soon as text exists
-    try { t.text = await transcribe(blob, t.ext, t.ac.signal); }
-    catch (e) { t.err = e; }
-    tryCommit(t);
+    tone('transcribing'); buzz(20);
+    t.pulse = setInterval(() => tone('busy'), CFG.pulseMs);   // busy pulse until the transcript is spoken
+    let text, err = null;
+    try { text = await transcribe(blob, t.ext, t.ac.signal); }
+    catch (e) { err = e; }
+    clearInterval(t.pulse); t.pulse = 0;
+    inflight.delete(t);
+    if (t.cancelled || ModeController.mode !== 'MIC') return;
+    t.phase = 'done';
+    if (err) { fail(sttErrorText(err)); return; }            // stays in voice idle
+    const clean_ = clean(text);
+    if (!clean_) { soft("Didn't catch that."); return; }     // stays in voice idle, never CONFIRM
+    enterConfirm(clean_, t.id);
   }
 
   function cancelTake(t) {
@@ -330,7 +374,7 @@
     safe(() => { if (t.rec && t.rec.state !== 'inactive') t.rec.stop(); });
     stopTracks(t); unmute();
     if (take === t) take = null;
-    tryCommit(t);                               // releases inflight bookkeeping
+    inflight.delete(t);
   }
 
   const PHANTOMS = new Set([
@@ -343,21 +387,6 @@
     const norm = s.toLowerCase().replace(/[^\p{L}\p{N}\s]/gu, '').replace(/\s+/g, ' ').trim();
     if (!norm || PHANTOMS.has(norm)) return '';
     return s;
-  }
-
-  function tryCommit(t) {
-    if (t.done) { inflight.delete(t); return; }
-    if (t.cancelled) { t.done = true; inflight.delete(t); return; }
-    if (!t.commitReady || (t.text === undefined && !t.err)) return;
-    if (G.open && G.take === t) return;         // a gesture may still turn this accept into 2 or 3
-    t.done = true; inflight.delete(t);
-    if (t.err) { fail(sttErrorText(t.err)); return; }
-    const text = clean(t.text);
-    if (!text) { tone('soft'); show("Didn't catch that"); say("Didn't catch that."); return; }   // never reaches handle()
-    if (ModeController.mode !== 'MIC') return;
-    tone('sent'); buzz(20);
-    turn = { epoch: ModeController.epoch };
-    safe(() => handle(text, 'mic-' + t.id, 'mic'));   // handle()/produce() own chat+speech retries and spoken errors
   }
 
   async function transcribe(blob, ext, outer) {
@@ -399,26 +428,81 @@
     throw lastErr || new Error('transcription failed');
   }
 
+  /* ================================================================ CONFIRM */
+  function enterConfirm(text, id) {
+    if (ModeController.mode !== 'MIC' || take) return;      // a new recording already started
+    if (pending) dropPending();
+    pending = { text, id, timer: 0, stop: null, quiet: false };
+    tone('confirm'); buzz(20); show('Heard: ' + text);
+    readBack();
+  }
+
+  // Device voice reads the transcript; the 20 s timeout starts when it finishes.
+  function readBack() {
+    const p = pending;
+    if (!p) return;
+    clearTimeout(p.timer);
+    stopReadBack(p);
+    const done = () => {
+      if (pending !== p || p.quiet) return;
+      p.stop = null;
+      clearTimeout(p.timer);
+      p.timer = setTimeout(() => expire(p), CFG.confirmMs);
+    };
+    p.stop = safe(() => speakUtter(p.text + '. ' + CFG.confirmHint, done)) || null;
+    if (!p.stop) done();
+  }
+  function stopReadBack(p) {
+    const s = p.stop; p.stop = null;
+    if (!s) return;
+    p.quiet = true; safe(s); p.quiet = false;
+  }
+  function dropPending() {
+    const p = pending; if (!p) return;
+    pending = null;
+    clearTimeout(p.timer);
+    stopReadBack(p);
+  }
+  function expire(p) {
+    if (pending !== p) return;
+    if (G.open) { p.timer = setTimeout(() => expire(p), 1000); return; }   // a gesture is deciding
+    dropPending();
+    tone('expired'); buzz([30, 50, 30]); show('Not sent, discarded');
+  }
+  function accept(p) {
+    if (pending !== p || ModeController.mode !== 'MIC') return;
+    dropPending();
+    tone('sent'); buzz(20); show('Sent');
+    turn = { epoch: ModeController.epoch };
+    safe(() => handle(p.text, 'mic-' + p.id, 'mic'));   // the ONLY call into handle(); produce() owns retries and spoken errors
+  }
+
   function repeatLast() {
     const ms = tone('repeat'); buzz([20, 60, 20]);
     show('Repeat');
     setTimeout(() => {
       if (ModeController.mode !== 'MIC' || take) return;   // left, or a new take started meanwhile
       const last = safe(() => Player.last);
-      if (!last) { show('Nothing to repeat'); say('Nothing to repeat yet.'); return; }
+      if (!last) { soft('Nothing to repeat yet.'); return; }
       try {
         if (Player.current) flushPlayback();              // restart from the beginning
         Player.enqueue([last], true);                      // same path as Player.playPressed()
       } catch (e) { fail('Repeat failed.'); }
     }, ms + 40);
   }
+  function repeatTranscript() {
+    const ms = tone('repeat'); buzz([20, 60, 20]);
+    show('Heard: ' + (pending ? pending.text : ''));
+    setTimeout(() => { if (pending && !take) readBack(); }, ms + 40);
+  }
 
   const Voice = {
     teardown() {
-      clearTimeout(G.timer); G.open = false; G.take = null; G.spec = null;
+      clearTimeout(G.timer); G.open = false; G.take = null; G.spec = null; G.pending = null;
       if (take) cancelTake(take);
       Array.from(inflight).forEach(cancelTake);
       inflight.clear();
+      dropPending();
       turn = null;
       unmute();
     }
@@ -428,10 +512,13 @@
   const G = {
     open: false, firstT: 0, lastT: 0, closeAt: 0, timer: 0,
     count: 0, startState: 'IDLE',
-    take: null,          // take that was recording/opening when the gesture began
-    spec: null,          // speculative take this gesture started on count 1
+    take: null,          // take that was recording when the gesture began
+    spec: null,          // recording this gesture started on count 1
+    pending: null,       // CONFIRM transcript when the gesture began
+    entered: false,      // RELAY gesture: count 1 entered voice mode
+    relayDone: false,    // RELAY gesture starting with nexttrack: today's skip already ran
     lastPrevT: -1e9, lastNextT: -1e9,
-    swallowUntil: 0      // events before this time are ignored (after a mode switch)
+    swallowUntil: 0      // events before this time are ignored (after leaving voice mode)
   };
   const lastKeyT = {};
 
@@ -441,30 +528,42 @@
     G.timer = setTimeout(closeGesture, Math.max(0, G.closeAt - now()));
   }
 
+  function openGesture(tn) {
+    G.open = true; G.firstT = tn; G.lastT = tn; G.count = 0;
+    G.startState = state();                       // decide from the state at gesture start
+    G.take = (G.startState === 'RECORDING') ? take : null;
+    G.pending = (G.startState === 'CONFIRM') ? pending : null;
+    G.spec = null; G.entered = false; G.relayDone = false;
+    G.lastPrevT = -1e9; G.lastNextT = -1e9;
+  }
+
+  // Deferred outcomes: the ones a further press could still change.
   function closeGesture() {
     if (!G.open) return;
     clearTimeout(G.timer);
     G.open = false;
-    const t = G.take, s = G.startState, n = G.count;
-    G.take = null; G.spec = null;
-    if (n === 1 && s === 'RECORDING' && t) { t.commitReady = true; tryCommit(t); }  // the only deferred action
+    const s = G.startState, n = G.count, p = G.pending, entered = G.entered;
+    G.take = null; G.spec = null; G.pending = null;
+    if (s === 'CONFIRM' && p && pending === p) {
+      if (n === 1) dropPending();               // replaced by the recording already running
+      else if (n === 2) accept(p);              // the only way into handle()
+      return;
+    }
+    if (s === 'RELAY' && entered && (n === 2 || n === 3) && ModeController.mode === 'MIC') {
+      announce('MIC');                          // stayed in voice mode, idle
+      return;
+    }
+    if ((s === 'IDLE' || s === 'SPEAKING') && n === 2) soft('Nothing to send.');
   }
 
+  // Pen events only. Volume keys go through alias().
   function onKey(action) {
     const tn = now();
     if (tn - (lastKeyT[action] || -1e9) < CFG.dedupe) return;     // same keycode within 80 ms
     lastKeyT[action] = tn;
 
-    if (action === 'stop') { leaveVoice(); return; }
-    if (action !== 'previoustrack' && action !== 'nexttrack' && action !== 'seekforward') return;
-
     if (G.open && tn >= G.closeAt) closeGesture();                // late timer: this event starts a new gesture
-    if (!G.open) {
-      G.open = true; G.firstT = tn; G.count = 0;
-      G.startState = state();                                     // rule 4: decide from state at gesture start
-      G.take = (G.startState === 'RECORDING') ? take : null;
-      G.spec = null; G.lastPrevT = -1e9; G.lastNextT = -1e9;
-    }
+    if (!G.open) openGesture(tn);
 
     let w;
     if (action === 'nexttrack') {
@@ -474,38 +573,88 @@
       G.lastNextT = tn;
     } else {
       w = 1;
-      if (action === 'previoustrack') G.lastPrevT = tn;
+      G.lastPrevT = tn;
     }
 
     G.lastT = tn;
     const before = G.count;
-    G.count = Math.min(3, G.count + w);
+    G.count = Math.min(CFG.maxCount, G.count + w);
     scheduleClose();
-    if (G.count > before) act(G.count);
+    if (G.count > before) act(G.count);           // a count skipped by one weighted event (0 -> 2) never acts
   }
 
+  // Immediate outcomes for the count just reached; each also undoes what count 1 started.
   function act(n) {
     const s = G.startState;
-    if (n === 1) {
-      if (s === 'IDLE' || s === 'SPEAKING') { startTake().catch(() => {}); G.spec = take; }       // speculative, zero latency
-      else if (s === 'RECORDING') { if (G.take) finishTake(G.take, 'accept').catch(() => {}); } // stop now, commit on close
-      else { tone('busy'); buzz(15); show('Busy'); }                                            // BUSY
-      return;
+    if (n === 4) { if (G.spec) cancelTake(G.spec); G.spec = null; leaveVoice(); return; }
+
+    switch (s) {
+      case 'RELAY':
+        if (n === 1) { G.entered = enterAndRecord(); G.spec = G.entered ? take : null; return; }
+        if (G.entered) { if (G.spec) cancelTake(G.spec); G.spec = null; return; }   // idle announce on close
+        if (n === 2 && !G.relayDone) {                                              // gesture began with nexttrack:
+          G.relayDone = true;                                                       // today's relay skip
+          const f = relayH.nexttrack; if (f) safe(() => f());
+          return;
+        }
+        tone('busy'); buzz(15);                                                     // 3 in relay: acknowledged, no action
+        return;
+
+      case 'IDLE':
+      case 'SPEAKING':
+        if (n === 1) { startTake().catch(() => {}); G.spec = take; return; }
+        if (G.spec) { cancelTake(G.spec); G.spec = null; }
+        if (n === 3) repeatLast();                  // 2: "nothing to send" on close
+        return;
+
+      case 'THINKING':
+        if (n === 3) { repeatLast(); return; }
+        tone('busy'); buzz(15); show('Busy');
+        return;
+
+      case 'RECORDING':
+        if (n === 1 && G.take) finishTake(G.take, 'press').catch(() => {});   // stop early -> transcribe
+        else { tone('busy'); buzz(15); }            // already stopping: acknowledge, nothing else
+        return;
+
+      case 'TRANSCRIBING':
+        tone('busy'); buzz(15); show('Transcribing, wait');
+        return;
+
+      case 'CONFIRM':
+        if (n === 1) { if (G.pending) stopReadBack(G.pending); startTake().catch(() => {}); G.spec = take; return; }
+        if (G.spec) { cancelTake(G.spec); G.spec = null; }
+        if (n === 2) { tone('busy'); buzz(15); show('Sending…'); return; }   // sent on close unless a 3rd press
+        if (n === 3) repeatTranscript();
+        return;
     }
-    // n >= 2: undo whatever count 1 did in this gesture
-    if (G.spec) { cancelTake(G.spec); G.spec = null; }
-    if (s === 'RECORDING' && G.take) cancelTake(G.take);
-    if (n === 2) { repeatLast(); return; }        // BUSY: the pending request keeps running
-    leaveVoice();                                 // n === 3
   }
 
+  function enterAndRecord() {
+    ModeController.set('MIC', true);
+    if (ModeController.mode !== 'MIC') return false;
+    startTake(CFG.enterLeadMs).catch(() => {});
+    return true;
+  }
   function leaveVoice() {
     G.swallowUntil = now() + CFG.G;               // trailing presses must not leak into relay handlers
     ModeController.set('RELAY');
   }
-  function enterVoice() {
-    G.swallowUntil = now() + CFG.G;               // a repeating long-press must not start a recording
-    ModeController.set('MIC');
+  function enterVoice() { ModeController.set('MIC'); }
+
+  // Volume keys: never counted. 'one' = exactly one pen press in the current state.
+  let lastAliasT = -1e9;
+  function alias(kind) {
+    const tn = now();
+    if (tn - lastAliasT < CFG.aliasGap) return;   // Button Mapper long-press auto-repeat
+    lastAliasT = tn;
+    // leave: teardown discards an open pen gesture (closing it could send a CONFIRM transcript)
+    if (kind === 'leave') { if (ModeController.mode === 'MIC') leaveVoice(); return; }
+    if (G.open) closeGesture();                   // a pen gesture in progress resolves first
+    openGesture(tn);
+    G.count = 1;
+    act(1);
+    closeGesture();                               // a complete one-press gesture
   }
 
   /* ================================================== MediaSession wrapper */
@@ -514,25 +663,29 @@
   let native = null;
 
   // One entry point for MediaSession actions and media keydown events.
-  // Returns true when voice mode consumed the action.
-  function route(action, details) {
+  // Returns true when this file consumed the action.
+  function route(action) {
     if (now() < G.swallowUntil) return true;
-    if (ModeController.mode === 'MIC') {
-      if (action === 'play' || action === 'pause') {
-        if (state() === 'RECORDING') return true;  // never let playback start into the mic
-        return false;                              // otherwise today's play / pause behaviour
-      }
-      onKey(action);
-      return true;
+    const mic = ModeController.mode === 'MIC';
+    if (action === 'play' || action === 'pause') {
+      return mic && state() === 'RECORDING';       // never let playback start into the mic
     }
-    if (action === 'seekforward' && !relayH.seekforward) { enterVoice(); return true; }  // unbound in relay today
-    return false;                                  // RELAY: counter inert
+    if (action === 'seekforward') {
+      if (!mic && relayH.seekforward) return false;
+      alias('one'); return true;
+    }
+    if (action === 'stop') {
+      if (!mic) return false;                      // relay: today's stop
+      alias('leave'); return true;
+    }
+    if (action === 'previoustrack' || action === 'nexttrack') { onKey(action); return true; }
+    return false;
   }
 
   function dispatch(action) {
     return function (details) {
       if (isCal()) { const f = relayH[action]; return f ? f(details) : undefined; }
-      if (route(action, details)) return;
+      if (route(action)) return;
       const f = relayH[action];
       if (f) return f(details);
     };
