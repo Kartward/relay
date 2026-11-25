@@ -102,6 +102,8 @@
 const DEFAULT_SYSTEM =
   'You are an expert in technical English writing for an Electronic Engineering course. ' +
   'The user text is notes plus an instruction; follow it. ' +
+  'A follow-up instruction may refer to the text just produced: keep its subject, terminology ' +
+  'and specifics, and do not repeat it verbatim. ' +
   'Usually the first requested text is a PRODUCT DESCRIPTION or PROCESS DESCRIPTION, and a ' +
   'follow-up instruction may then ask for an IMPACT ANALYSIS of the same subject. Infer the type ' +
   'and the topic; if the type is unclear, default to process description. ' +
@@ -468,11 +470,17 @@ function cleanForSpeech(s) {
     .trim();
 }
 
+const CONTEXT = []; // last two exchanges, memory only, cleared on reload
+
 async function chat(text) {
   const body = {
     model: cfg.model,
     messages: [
       { role: 'system', content: cfg.system || DEFAULT_SYSTEM },
+      ...CONTEXT.flatMap((c) => [
+        { role: 'user', content: c.req },
+        { role: 'assistant', content: c.reply }
+      ]),
       { role: 'user', content: text }
     ]
   };
@@ -535,6 +543,8 @@ async function produce(raw) {
   let reply;
   try { reply = await chat(raw); }
   catch (e) { return failure(e, raw, 'Chat'); }
+  CONTEXT.push({ req: raw, reply });
+  if (CONTEXT.length > 2) CONTEXT.shift();
   const items = [];
   for (const part of chunkForTts(reply)) {
     try { items.push({ kind: 'clip', buffer: await speech(part), text: part }); }
