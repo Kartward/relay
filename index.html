@@ -79,6 +79,8 @@
     <input id="fModel" spellcheck="false" autocapitalize="off" autocorrect="off"></label>
   <label>Voice
     <select id="fVoice"></select></label>
+  <label>Speech speed (0.5 slow – 1.0 normal)
+    <input id="fSpeed" type="number" step="0.05" min="0.4" max="1.3" inputmode="decimal"></label>
   <label>System prompt
     <textarea id="fSystem" rows="6"></textarea></label>
   <div class="pair">
@@ -110,6 +112,7 @@ const DEFAULTS = {
   model: 'gpt-6.1-terra',
   ttsModel: 'gpt-4o-mini-tts',
   voice: 'alloy',
+  ttsSpeed: 0.8,
   system: DEFAULT_SYSTEM
 };
 const VOICES = ['alloy','ash','ballad','coral','echo','fable','nova','onyx','sage','shimmer','verse'];
@@ -270,12 +273,18 @@ function speakNow(text) {
   else Earcon.play('ready');
 }
 
+function clampSpeed(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? Math.min(1.3, Math.max(0.4, n)) : DEFAULTS.ttsSpeed;
+}
+
 // Returns a stop function. done() is called exactly once.
 function speakUtter(text, done) {
   let finished = false, timer = 0;
   const fin = () => { if (finished) return; finished = true; clearTimeout(timer); done(); };
   if (!('speechSynthesis' in window)) { Earcon.play('error'); timer = setTimeout(fin, 400); return fin; }
   const u = new SpeechSynthesisUtterance(text);
+  u.rate = clampSpeed(cfg.ttsSpeed);
   u.onend = fin; u.onerror = fin;
   timer = setTimeout(fin, 5000 + text.length * 90); // Chrome sometimes never fires onend
   speechSynthesis.speak(u);
@@ -475,6 +484,7 @@ async function speech(text) {
   const mp3 = await openai('audio/speech', {
     model: cfg.ttsModel,
     voice: cfg.voice,
+    speed: clampSpeed(cfg.ttsSpeed),
     input: text,
     response_format: 'mp3'
   }, TTS_TIMEOUT_MS, 'buffer');
@@ -717,6 +727,7 @@ function openSettings(withSound = true) {
   $('fModel').value = cfg.model;
   fillVoices();
   $('fSystem').value = cfg.system;
+  $('fSpeed').value = cfg.ttsSpeed;
   $('settings').classList.remove('hidden');
   if (withSound) Earcon.play('settings');
 }
@@ -738,6 +749,7 @@ $('settings').addEventListener('submit', (e) => {
     topic, key, server,
     model: $('fModel').value.trim() || DEFAULTS.model,
     voice: $('fVoice').value || DEFAULTS.voice,
+    ttsSpeed: clampSpeed($('fSpeed').value),
     system: $('fSystem').value.trim() || DEFAULT_SYSTEM
   });
   saveConfig();
