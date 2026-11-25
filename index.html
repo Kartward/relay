@@ -543,6 +543,7 @@ const NetworkSource = {
   name: 'network',
   sink: null, es: null, dropped: false, lastBeat: 0, retryMs: 2000,
   timer: null, wd: null, bound: false,
+  polling: false, pollTimer: null, openTimer: null, busyPoll: false,
 
   start(sink) {
     this.sink = sink;
@@ -564,6 +565,8 @@ const NetworkSource = {
 
   stop() {
     clearTimeout(this.timer); this.timer = null;
+    clearTimeout(this.openTimer); this.openTimer = null;
+    clearInterval(this.pollTimer); this.pollTimer = null;
     if (this.es) { this.es.close(); this.es = null; }
   },
 
@@ -576,9 +579,15 @@ const NetworkSource = {
 
   connect() {
     this.stop();
+    this.polling = false;
     const es = new EventSource(this.url());
     this.es = es;
     this.lastBeat = Date.now();
+    // If the stream never opens -- buffering proxy, filtered host -- fall back to polling.
+    this.openTimer = setTimeout(() => {
+      if (this.polling) return;
+      if (Date.now() - this.lastBeat > 5000) this.degrade();
+    }, 6000);
     // "Connecting" is announced by the spoken "Ready" or the disconnect tone before it.
     detail('sNet', this.dropped ? 'Reconnecting' : 'Connecting');
 
@@ -593,12 +602,10 @@ const NetworkSource = {
     const onEvent = (e) => {
       if (es !== this.es) return;
       this.lastBeat = Date.now(); // any ntfy frame (open / keepalive / message) counts
+      clearTimeout(this.openTimer); this.openTimer = null;
       if (!e.data) return;
       let d; try { d = JSON.parse(e.data); } catch { return; }
-      if (d.event === 'message' && d.id) {
-        localStorage.setItem(LS.lastId, d.id);
-        this.sink(d.message, d.id, this.name);
-      }
+      this.feed(d);
     };
     for (const t of ['message', 'open', 'keepalive', 'poll_request']) es.addEventListener(t, onEvent);
 
@@ -617,6 +624,48 @@ const NetworkSource = {
 
   watchdog() {
     if (this.es && Date.now() - this.lastBeat > KEEPALIVE_TIMEOUT_MS) this.drop('No keepalive for 90 s');
+  },
+
+  feed(d) {
+    if (!d || d.event !== 'message' || !d.id || !this.sink) return;
+    localStorage.setItem(LS.lastId, d.id);
+    this.sink(d.message, d.id, this.name);
+  },
+
+  // A buffering proxy or a filtered host keeps the stream silent. Poll the same feed
+  // instead: each request closes, so buffering cannot hide messages.
+  degrade() {
+    if (this.polling) return;
+    this.polling = true;
+    const keep = this.dropped;
+    this.stop();
+    this.dropped = keep;
+    setNet('Stream unavailable, polling', 'reconnect');
+    this.pollOnce();
+    this.pollTimer = setInterval(() => this.pollOnce(), 900);
+  },
+
+  async pollOnce() {
+    if (this.busyPoll) return;
+    this.busyPoll = true;
+    try {
+      const base = this.url();
+      const r = await fetch(base + (base.includes('?') ? '&' : '?') + 'poll=1', { cache: 'no-store' });
+      if (r.ok) {
+        const text = await r.text();
+        this.lastBeat = Date.now();
+        clearTimeout(this.openTimer); this.openTimer = null;
+        for (const line of text.split('\n')) {
+          if (!line.trim()) continue;
+          let d; try { d = JSON.parse(line); } catch { continue; }
+          this.feed(d);
+        }
+      }
+    } catch (e) {
+      console.log('[vr] poll failed', e);
+    } finally {
+      this.busyPoll = false;
+    }
   }
 };
 
