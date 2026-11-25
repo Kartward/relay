@@ -445,8 +445,8 @@ async function chat(text) {
       { role: 'user', content: text }
     ]
   };
-  // GPT-6.2 throws these away; older models still want them.
-  if (!/^gpt-6\.2/i.test(cfg.model)) body.temperature = 0.3;
+  // The whole GPT-6 family rejects temperature/top_p; older models still want them.
+  if (!/^gpt-6/i.test(cfg.model)) body.temperature = 0.3;
   const j = await openai('chat/completions', body, CHAT_TIMEOUT_MS, 'json');
   const out = j && j.choices && j.choices[0] && j.choices[0].message && j.choices[0].message.content;
   const clean = out ? cleanForSpeech(out) : '';
