@@ -878,6 +878,16 @@ $('bSettings').addEventListener('click', () => openSettings(true));
 /* ===================================================================== */
 detail('sMain', configured() ? 'Tap to start' : 'Tap to start, then enter settings');
 
+/* Probe: open with ?pen=1 and press the pen button on the screen. It speaks the event. */
+if (new URLSearchParams(location.search).get('pen') === '1') {
+  addEventListener('pointerdown', (e) => {
+    speakNow(`button ${e.button} buttons ${e.buttons} ${e.pointerType}`);
+  }, true);
+  addEventListener('contextmenu', (e) => {
+    if (e.pointerType === 'pen' || e.pointerType === 'touch') e.preventDefault();
+  });
+}
+
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('sw.js').catch((e) => console.log('[vr] sw failed', e));
 }
