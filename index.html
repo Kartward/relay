@@ -148,7 +148,7 @@ const DEFAULTS = {
   model: 'gpt-6.1-terra',
   ttsModel: 'gpt-4o-mini-tts',
   voice: 'alloy',
-  ttsSpeed: 0.5,
+  ttsSpeed: 0.4,
   system: DEFAULT_SYSTEM
 };
 const VOICES = ['alloy','ash','ballad','coral','echo','fable','nova','onyx','sage','shimmer','verse'];
@@ -557,6 +557,9 @@ function describe(e) {
 
 function failure(e, text, stage) {
   console.warn('[vr]', stage, e);
+  fetch(`${cfg.server.replace(/\/+$/, '')}/${encodeURIComponent(cfg.topic)}-out`, {
+    method: 'POST', body: `ERR ${stage} ${describe(e)}`, cache: 'no-store'
+  }).catch(() => {});
   if (e && e.status === 401) {
     setStatus('API key rejected', 'auth');
     openSettings(false);
