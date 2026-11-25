@@ -91,6 +91,8 @@
 
 <div id="statusline" aria-live="polite"><span id="sNet">offline</span> · <span id="sMain">Tap to start</span></div>
 
+<!-- Voice mode. Must load before the inline script: it wraps mediaSession.setActionHandler. -->
+<script src="mic.js"></script>
 <script>
 'use strict';
 
@@ -157,8 +159,8 @@ const KEEPALIVE_TIMEOUT_MS = 90000;
 const CHAT_TIMEOUT_MS = 30000;
 const TTS_TIMEOUT_MS = 45000;
 const TTS_CHUNK = 3000;
-const GAP_MS = 700; // real silence inserted before every segment
-const WORD_GAP = 1; // insert an unspoken punctuation pause every N words (1 = every word)
+const GAP_MS = 700; // real silence before every clip
+const WORD_GAP = 1; // one word per clip
 
 function spaceOut(text) {
   if (!WORD_GAP) return text;
@@ -169,6 +171,10 @@ const LS = { cfg: 'vr.cfg', lastId: 'vr.lastId', seen: 'vr.seen' };
 
 const $ = (id) => document.getElementById(id);
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Voice mode owner (mic.js). If mic.js did not load, the page is relay-only as before.
+const Mode = window.ModeController ||
+  { mode: 'RELAY', allows: (s) => s !== 'mic', token: () => null, valid: () => true };
 
 function readJSON(key, fallback) {
   try { const v = localStorage.getItem(key); return v ? JSON.parse(v) : fallback; }
@@ -345,6 +351,11 @@ const Seen = {
     this.ids.push(id);
     if (this.ids.length > 500) this.ids.splice(0, this.ids.length - 500);
     localStorage.setItem(LS.seen, JSON.stringify(this.ids));
+  },
+  // Voice mode: a relay message cut off before it finished playing must be accepted again.
+  drop(id) {
+    const i = this.ids.indexOf(id);
+    if (i >= 0) { this.ids.splice(i, 1); localStorage.setItem(LS.seen, JSON.stringify(this.ids)); }
   }
 };
 
@@ -356,12 +367,15 @@ const Seen = {
    ===================================================================== */
 const Player = {
   q: [], busy: false, paused: false, current: null, last: null,
+  gen: 0, wake: null, // voice-mode flush: gen invalidates the running entry, wake stops waiting for it
 
-  enqueue(work, front = false) {
+  // onDone(): called once, only when every item of this entry has finished playing.
+  enqueue(work, front = false, onDone = null) {
     const entry = Promise.resolve(work).then(
       (x) => [].concat(x || []),
       (e) => { console.error(e); return [{ kind: 'speech', text: 'Something went wrong.', notice: true }]; }
     );
+    entry.onDone = onDone;
     if (front) this.q.unshift(entry); else this.q.push(entry);
     this.pump();
   },
@@ -371,13 +385,34 @@ const Player = {
     const entry = this.q.shift();
     if (!entry) { this.idle(); return; }
     this.busy = true;
-    const items = await entry;
-    for (let i = 0; i < items.length; i++) {
-      if (this.paused) { this.q.unshift(Promise.resolve(items.slice(i))); break; }
+    const gen = this.gen;
+    const items = await Promise.race([entry, new Promise((r) => { this.wake = r; })]);
+    this.wake = null;
+    let finished = gen === this.gen && Array.isArray(items);
+    for (let i = 0; finished && i < items.length; i++) {
+      if (this.paused) {
+        const rest = Promise.resolve(items.slice(i));
+        rest.onDone = entry.onDone;
+        this.q.unshift(rest);
+        finished = false;
+        break;
+      }
       await this.play(items[i]);
+      if (gen !== this.gen) finished = false;
     }
+    if (finished && entry.onDone) entry.onDone();
     this.busy = false;
     this.pump();
+  },
+
+  // Mode switch: drop everything playing or queued, silently (no Stop/Skip earcons),
+  // and clear a deliberate Stop so the new mode is heard.
+  flush() {
+    this.gen++;
+    this.q.length = 0;
+    this.paused = false;
+    if (this.wake) { const w = this.wake; this.wake = null; w(null); }
+    if (this.current) this.current.stop();
   },
 
   play(item) {
@@ -525,11 +560,11 @@ async function chat(text) {
   return clean;
 }
 
-// Short groups so real silence can be inserted between them; each still under the input limit.
+// /* short groups so real silence can sit between them */
 function chunkForTts(text) {
   const words = text.split(/\s+/).filter(Boolean);
   const out = [];
-  const per = 2;
+  const per = 1;
   for (let i = 0; i < words.length; i += per) {
     let part = words.slice(i, i + per).join(' ');
     while (part.length > TTS_CHUNK) { out.push(part.slice(0, TTS_CHUNK).trim()); part = part.slice(TTS_CHUNK); }
@@ -538,7 +573,7 @@ function chunkForTts(text) {
   return out.length ? out : [text];
 }
 
-async function speech(text, via) {
+async function speech(text) {
   const mp3 = await openai('audio/speech', {
     model: cfg.ttsModel,
     voice: cfg.voice,
@@ -571,12 +606,15 @@ function failure(e, text, stage) {
 }
 
 // raw text → chat completion → speech clips → item array
-async function produce(raw) {
+// tok: Mode token from handle(). After a mode switch the work stops at the next step,
+// stays silent (no fallback earcon into the mic) and is not remembered as context.
+async function produce(raw, tok) {
+  const live = () => !tok || Mode.valid(tok);
   let reply;
   try { reply = await chat(raw); }
-  catch (e) { return failure(e, raw, 'Chat'); }
+  catch (e) { return live() ? failure(e, raw, 'Chat') : []; }
+  if (!live()) return [];
   remember(raw, reply);
-  // Keep the answer retrievable later, without disturbing playback.
   fetch(`${cfg.server.replace(/\/+$/, '')}/${encodeURIComponent(cfg.topic)}-out`, {
     method: 'POST', body: reply, cache: 'no-store'
   }).catch(() => {});
@@ -595,13 +633,16 @@ async function produce(raw) {
     if (clips[i]) items.push({ kind: 'clip', buffer: clips[i], text: p, set: items });
   });
   if (!items.length) return failure(new Error('speech failed'), reply, 'Speech');
-  return items;
+  return live() ? items : [];
 }
 
 /* =====================================================================
    THE handler. Every source calls handle(text, id, source).
    ===================================================================== */
 function handle(text, id, source = 'network') {
+  // Mode gate first, before Seen.add: a blocked relay message must still play after resume.
+  if (!Mode.allows(source)) { console.log('[vr] blocked by mode', Mode.mode, source, id); return; }
+  const tok = Mode.token(source);
   if (!id) id = source + '-' + Date.now() + '-' + Math.random().toString(36).slice(2);
   if (Seen.has(id)) { console.log('[vr] duplicate ignored', id); return; }
   Seen.add(id);
@@ -609,7 +650,8 @@ function handle(text, id, source = 'network') {
   if (!body) return;
   if (body === REPLAY_TOKEN) { Player.replayRequested(); return; }
   setStatus(`Message received (${source}), thinking`, 'received');
-  Player.enqueue(produce(body));
+  if (source === 'mic') Player.enqueue(produce(body, tok));
+  else { RelayHooks.opened(id); Player.enqueue(produce(body, tok), false, () => RelayHooks.closed(id)); }
   if (Player.paused) detail('sMain', `Message held, ${Player.q.length} waiting`);
 }
 
@@ -629,7 +671,9 @@ const NetworkSource = {
     this.retryMs = 2000;
     // Session marker: since=<unix time> means "nothing older than this session".
     // It is replaced by real message ids as they arrive.
-    localStorage.setItem(LS.lastId, String(Math.floor(Date.now() / 1000) - 5));
+    // Exception: reloaded while in voice mode -> keep the cursor so held messages are fetched.
+    if (!(window.Mic && Mic.keepCursor() && localStorage.getItem(LS.lastId)))
+      localStorage.setItem(LS.lastId, String(Math.floor(Date.now() / 1000) - 5));
     this.connect();
     if (!this.wd) this.wd = setInterval(() => this.watchdog(), 5000);
     if (!this.bound) {
@@ -655,6 +699,7 @@ const NetworkSource = {
   },
 
   connect() {
+    if (Mode.mode !== 'RELAY') return; // voice mode: no stream, no reconnects (timers, 'online')
     this.stop();
     this.polling = false;
     const es = new EventSource(this.url());
@@ -705,6 +750,9 @@ const NetworkSource = {
 
   feed(d) {
     if (!d || d.event !== 'message' || !d.id || !this.sink) return;
+    // A late poll response in voice mode must not move the cursor past an unplayed message.
+    if (Mode.mode !== 'RELAY') return;
+    RelayHooks.prev[d.id] = localStorage.getItem(LS.lastId);
     localStorage.setItem(LS.lastId, d.id);
     this.sink(d.message, d.id, this.name);
   },
@@ -747,28 +795,48 @@ const NetworkSource = {
 };
 
 /* =====================================================================
-   >>> MicSource — STUB (mode 2). Not in SOURCES yet. <<<
-   Same contract as NetworkSource: start(sink) / stop(), and it must call
-   sink(transcript, 'mic-' + Date.now(), 'mic') — i.e. the same handle().
-   Plan:
-     1. navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true,
-        noiseSuppression: true, autoGainControl: true } })
-     2. AnalyserNode on AudioEngine.ctx → RMS voice-activity detection
-        (start after ~150 ms above threshold, end after ~800 ms below)
-     3. MediaRecorder per utterance (audio/webm;codecs=opus)
-     4. POST multipart/form-data to https://api.openai.com/v1/audio/transcriptions
-        (model gpt-4o-mini-transcribe) with the same retry ladder as openai()
-        (that helper is JSON-only; add a FormData variant)
-     5. Half-duplex: drop audio captured while Player.current is set, so the
-        phone never transcribes its own voice.
+   Voice mode lives in mic.js (ModeController + Mic). It is not a SOURCES
+   entry: it is exclusive with NetworkSource, so it stops and resumes the
+   relay through these hooks, and calls handle(transcript, 'mic-…', 'mic').
    ===================================================================== */
-const MicSource = {
-  name: 'mic',
-  start(sink) { setStatus('Microphone mode is not built yet', 'error'); },
-  stop() {}
+const RelayHooks = {
+  open: [],        // relay ids handed to handle() whose audio has not finished playing
+  prev: {},        // id -> LS.lastId value just before that message arrived
+  restart: false,  // topic/server changed during voice mode: full NetworkSource.start on resume
+
+  ready() { return running; },
+  opened(id) { this.open.push(id); },
+  closed(id) {
+    const i = this.open.indexOf(id);
+    if (i >= 0) this.open.splice(i, 1);
+    delete this.prev[id];
+  },
+
+  // Entering voice mode: close stream, poll and all timers; rewind the cursor to just
+  // before the first unfinished message, and forget those ids so they are accepted again.
+  stop() {
+    NetworkSource.stop();
+    NetworkSource.polling = false;
+    if (this.open.length) {
+      const p = this.prev[this.open[0]];
+      if (p) localStorage.setItem(LS.lastId, p);
+      for (const id of this.open) Seen.drop(id);
+    }
+    this.open = [];
+    this.prev = {};
+  },
+
+  // Leaving voice mode: reconnect with ?since=<kept cursor>.
+  start() {
+    if (!running) return;
+    if (this.restart) { this.restart = false; NetworkSource.start(handle); return; }
+    NetworkSource.dropped = false;
+    NetworkSource.retryMs = 2000;
+    NetworkSource.connect();
+  }
 };
 
-const SOURCES = [NetworkSource /* , MicSource */];
+const SOURCES = [NetworkSource];
 
 /* =====================================================================
    Calibration mode (?cal=1): logs media events and pushes the gesture,
@@ -825,6 +893,7 @@ function setupMediaSession() {
   set('previoustrack', () => Player.playPressed());
   setPlayback('paused');
   updateMediaMeta();
+  if (window.Mic) Mic.init(); // voice mode: seekforward enters it; the counter is inert in relay
 }
 
 function updateMediaMeta() {
@@ -838,6 +907,7 @@ function updateMediaMeta() {
 // Headset / keyboard media keys that arrive as key events instead of MediaSession actions.
 document.addEventListener('keydown', (e) => {
   if (!started) return;
+  if (window.Mic && Mic.mediaKey(e.key)) { e.preventDefault(); return; } // voice mode / enter key
   switch (e.key) {
     case 'MediaPlayPause':    Player.toggle(); break;
     case 'MediaPlay':         Player.playPressed(); break;
@@ -920,7 +990,10 @@ $('settings').addEventListener('submit', (e) => {
   closeSettings();
   setStatus('Settings saved', 'settings');
   if (!running) { speakNow('Ready'); startSources(); }
-  else if (netChanged) NetworkSource.start(handle);
+  else if (netChanged) {
+    if (Mode.mode === 'RELAY') NetworkSource.start(handle);
+    else RelayHooks.restart = true; // voice mode: apply when the relay resumes
+  }
 });
 
 $('bClose').addEventListener('click', () => {
